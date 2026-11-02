@@ -1,0 +1,204 @@
+{
+  "schema": 1,
+  "constants": {
+    "PROTOCOL_MAJOR": {
+      "value": 1,
+      "unit": "",
+      "note": "Incompatible wire changes only"
+    },
+    "PROTOCOL_MINOR": {
+      "value": 1,
+      "unit": "",
+      "note": "Backward-compatible additions"
+    },
+    "DEFAULT_PORT": {
+      "value": 47800,
+      "unit": "tcp port",
+      "note": "Always advertised, never assumed"
+    },
+    "BEACON_PORT": {
+      "value": 47801,
+      "unit": "udp port",
+      "note": "Discovery fallback"
+    },
+    "BEACON_INTERVAL_MS": {
+      "value": 2000,
+      "unit": "ms",
+      "note": ""
+    },
+    "CHUNK_SIZE_DEFAULT": {
+      "value": 4194304,
+      "unit": "bytes",
+      "note": "4 MiB"
+    },
+    "CHUNK_SIZE_MIN": {
+      "value": 65536,
+      "unit": "bytes",
+      "note": ""
+    },
+    "CHUNK_SIZE_MAX": {
+      "value": 16777216,
+      "unit": "bytes",
+      "note": ""
+    },
+    "DATA_FRAME_OVERHEAD": {
+      "value": 41,
+      "unit": "bytes",
+      "note": "1 type + 8 header + 32 hash"
+    },
+    "MAX_DATA_FRAME": {
+      "value": 16777257,
+      "unit": "bytes",
+      "note": "CHUNK_SIZE_MAX + DATA_FRAME_OVERHEAD"
+    },
+    "MAX_CONTROL_FRAME": {
+      "value": 1048576,
+      "unit": "bytes",
+      "note": "1 MiB"
+    },
+    "DATA_STREAMS_DEFAULT": {
+      "value": 4,
+      "unit": "",
+      "note": ""
+    },
+    "DATA_STREAMS_MAX": {
+      "value": 8,
+      "unit": "",
+      "note": ""
+    },
+    "WINDOW_CHUNKS_PER_STREAM": {
+      "value": 8,
+      "unit": "chunks",
+      "note": ""
+    },
+    "MANIFEST_PART_MAX_ENTRIES": {
+      "value": 1000,
+      "unit": "entries",
+      "note": ""
+    },
+    "MAX_MANIFEST_ENTRIES": {
+      "value": 1000000,
+      "unit": "entries",
+      "note": "Larger offers are rejected with PATH_INVALID"
+    },
+    "MAX_PATH_BYTES": {
+      "value": 4096,
+      "unit": "bytes",
+      "note": "UTF-8"
+    },
+    "MAX_SEGMENT_BYTES": {
+      "value": 255,
+      "unit": "bytes",
+      "note": "UTF-8"
+    },
+    "MAX_CONTROL_CONNECTIONS": {
+      "value": 16,
+      "unit": "connections",
+      "note": "Concurrent, per device"
+    },
+    "HELLO_TIMEOUT_MS": {
+      "value": 10000,
+      "unit": "ms",
+      "note": "Close a TLS connection that sends no HELLO"
+    },
+    "PING_INTERVAL_MS": {
+      "value": 5000,
+      "unit": "ms",
+      "note": "When idle"
+    },
+    "DEAD_PEER_TIMEOUT_MS": {
+      "value": 15000,
+      "unit": "ms",
+      "note": ""
+    },
+    "PAIR_TOKEN_TTL_S": {
+      "value": 120,
+      "unit": "s",
+      "note": ""
+    },
+    "PAIR_TOKEN_BYTES": {
+      "value": 16,
+      "unit": "bytes",
+      "note": "Random"
+    },
+    "PAIR_MAX_FAILED_ATTEMPTS": {
+      "value": 3,
+      "unit": "attempts",
+      "note": "Token invalidated after this many failures"
+    },
+    "PARTIAL_RETENTION_DAYS": {
+      "value": 7,
+      "unit": "days",
+      "note": "Receiver resume state"
+    },
+    "OFFER_RESPONSE_TIMEOUT_S": {
+      "value": 300,
+      "unit": "s",
+      "note": "Receiver user has this long to answer an OFFER"
+    },
+    "PAUSED_SERVICE_LIMIT_S": {
+      "value": 600,
+      "unit": "s",
+      "note": "Android: a paused transfer releases its service after this"
+    },
+    "HASH_ALGO": {
+      "value": "SHA-256",
+      "unit": "",
+      "note": "Chunk hashing and fingerprints"
+    },
+    "MAX_NEED_PAIRS_PER_FRAME": {
+      "value": 1024,
+      "unit": "pairs",
+      "note": "CHUNK_NEED limit per frame"
+    }
+  },
+  "frame_types": {
+    "HELLO": 1,
+    "HELLO_OK": 2,
+    "OFFER": 16,
+    "MANIFEST_PART": 17,
+    "MANIFEST_END": 18,
+    "ACCEPT": 19,
+    "REJECT": 20,
+    "DATA": 32,
+    "CHUNK_ACK": 33,
+    "FILE_DONE": 34,
+    "CHUNK_NEED": 35,
+    "PAUSE": 48,
+    "RESUME": 49,
+    "CANCEL": 50,
+    "DONE": 64,
+    "DONE_OK": 65,
+    "PAIR_REQUEST": 80,
+    "PAIR_OK": 81,
+    "PING": 125,
+    "PONG": 126,
+    "ERROR": 127
+  },
+  "error_codes": {
+    "UNSUPPORTED_VERSION": 1,
+    "NOT_PAIRED": 2,
+    "REJECTED": 3,
+    "DISK_FULL": 4,
+    "PATH_INVALID": 5,
+    "HASH_MISMATCH": 6,
+    "FILE_CHANGED": 7,
+    "BUSY": 8,
+    "PROTOCOL_ERROR": 9,
+    "CANCELLED": 10,
+    "TIMEOUT": 11,
+    "FILE_TOO_LARGE_FOR_FS": 12,
+    "PAIR_TOKEN_INVALID": 13,
+    "STATE_INTEGRITY": 14
+  },
+  "local_error_codes": [
+    "NO_NETWORK",
+    "LISTENER_FAILED",
+    "FIREWALL_BLOCKED",
+    "LOCAL_NETWORK_DENIED",
+    "OS_BACKGROUND_LIMIT",
+    "STORAGE_ACCESS_LOST",
+    "PAIR_FINGERPRINT_MISMATCH",
+    "STATE_TAMPERED"
+  ]
+}

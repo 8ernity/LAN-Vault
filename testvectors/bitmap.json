@@ -1,0 +1,23 @@
+{
+  "chunk_count": 10,
+  "completed": [
+    0,
+    1,
+    2,
+    9
+  ],
+  "bitmap_hex": "0702",
+  "bitmap_base64": "BwI=",
+  "invalid_examples": [
+    {
+      "note": "bit set beyond chunk_count",
+      "chunk_count": 10,
+      "bitmap_base64": "AAQ="
+    },
+    {
+      "note": "wrong length",
+      "chunk_count": 10,
+      "bitmap_base64": "Bw=="
+    }
+  ]
+}

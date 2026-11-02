@@ -1,0 +1,354 @@
+{
+  "schema": 1,
+  "settings": [
+    {
+      "key": "general.device_name",
+      "page": "General",
+      "label": "Device name",
+      "type": "string",
+      "options": {
+        "min": 1,
+        "max": 63
+      },
+      "default": "@os_device_name",
+      "platform": "both",
+      "priority": "P0",
+      "note": ""
+    },
+    {
+      "key": "general.theme",
+      "page": "General",
+      "label": "Theme",
+      "type": "enum",
+      "options": [
+        "system",
+        "light",
+        "dark"
+      ],
+      "default": "system",
+      "platform": "both",
+      "priority": "P0",
+      "note": ""
+    },
+    {
+      "key": "general.language",
+      "page": "General",
+      "label": "Language",
+      "type": "enum",
+      "options": [
+        "en"
+      ],
+      "default": "en",
+      "platform": "both",
+      "priority": "P0",
+      "note": ""
+    },
+    {
+      "key": "general.launch_at_signin",
+      "page": "General",
+      "label": "Launch at sign-in",
+      "type": "bool",
+      "options": [
+        true,
+        false
+      ],
+      "default": false,
+      "platform": "windows",
+      "priority": "P0",
+      "note": ""
+    },
+    {
+      "key": "general.start_minimized",
+      "page": "General",
+      "label": "Start minimized",
+      "type": "bool",
+      "options": [
+        true,
+        false
+      ],
+      "default": false,
+      "platform": "windows",
+      "priority": "P0",
+      "note": ""
+    },
+    {
+      "key": "general.close_behavior",
+      "page": "General",
+      "label": "Close button",
+      "type": "enum",
+      "options": [
+        "tray",
+        "exit"
+      ],
+      "default": "tray",
+      "platform": "windows",
+      "priority": "P0",
+      "note": ""
+    },
+    {
+      "key": "general.prevent_sleep",
+      "page": "General",
+      "label": "Prevent sleep during transfer",
+      "type": "bool",
+      "options": [
+        true,
+        false
+      ],
+      "default": true,
+      "platform": "windows",
+      "priority": "P0",
+      "note": ""
+    },
+    {
+      "key": "receiving.save_folder",
+      "page": "Receiving",
+      "label": "Save folder",
+      "type": "folder",
+      "options": null,
+      "default": "@downloads/LANVault",
+      "platform": "both",
+      "priority": "P0",
+      "note": ""
+    },
+    {
+      "key": "receiving.ask_before_accepting",
+      "page": "Receiving",
+      "label": "Ask before accepting",
+      "type": "bool",
+      "options": [
+        true
+      ],
+      "default": true,
+      "platform": "both",
+      "priority": "P0",
+      "note": "Fixed ON in application v1.0. P1 auto-accept in application v1.1 is per explicitly paired device; unpaired offers always require approval."
+    },
+    {
+      "key": "receiving.allow_unpaired",
+      "page": "Receiving",
+      "label": "Allow unpaired senders",
+      "type": "bool",
+      "options": [
+        true,
+        false
+      ],
+      "default": false,
+      "platform": "both",
+      "priority": "P0",
+      "note": ""
+    },
+    {
+      "key": "receiving.visibility",
+      "page": "Receiving",
+      "label": "Visibility",
+      "type": "enum",
+      "options": [
+        "everyone",
+        "receive_tab_only",
+        "hidden"
+      ],
+      "default": "everyone",
+      "platform": "both",
+      "priority": "P0",
+      "note": ""
+    },
+    {
+      "key": "receiving.standby_window",
+      "page": "Receiving",
+      "label": "Standby receive window",
+      "type": "enum",
+      "options": [
+        "off",
+        "15m",
+        "60m"
+      ],
+      "default": "off",
+      "platform": "android",
+      "priority": "P1",
+      "note": "P1 only: optional explicitly started 15/60-minute standby session, subject to OS restrictions. No perpetual idle dataSync service; foreground opening always works for P0."
+    },
+    {
+      "key": "receiving.dnd",
+      "page": "Receiving",
+      "label": "Do not disturb",
+      "type": "enum",
+      "options": [
+        "off",
+        "1h"
+      ],
+      "default": "off",
+      "platform": "both",
+      "priority": "P1",
+      "note": ""
+    },
+    {
+      "key": "network.interface",
+      "page": "Network",
+      "label": "Network interface",
+      "type": "enum",
+      "options": [
+        "auto",
+        "@interface"
+      ],
+      "default": "auto",
+      "platform": "windows",
+      "priority": "P0",
+      "note": ""
+    },
+    {
+      "key": "network.mode",
+      "page": "Network",
+      "label": "Network mode",
+      "type": "enum",
+      "options": [
+        "auto"
+      ],
+      "default": "auto",
+      "platform": "android",
+      "priority": "P0",
+      "note": "Auto routes only to directly reachable local Wi-Fi client or phone-hosted hotspot interfaces; do not bind indiscriminately to cellular. Must work without internet."
+    },
+    {
+      "key": "network.port",
+      "page": "Network",
+      "label": "Listening port",
+      "type": "port",
+      "options": {
+        "auto": true
+      },
+      "default": "auto",
+      "platform": "both",
+      "priority": "P0",
+      "note": ""
+    },
+    {
+      "key": "network.streams",
+      "page": "Network",
+      "label": "Parallel streams",
+      "type": "int",
+      "options": {
+        "auto": true,
+        "min": 1,
+        "max": "DATA_STREAMS_MAX"
+      },
+      "default": "auto",
+      "platform": "both",
+      "priority": "P0",
+      "note": ""
+    },
+    {
+      "key": "network.beacon_fallback",
+      "page": "Network",
+      "label": "UDP beacon fallback",
+      "type": "bool",
+      "options": [
+        true,
+        false
+      ],
+      "default": true,
+      "platform": "both",
+      "priority": "P0",
+      "note": ""
+    },
+    {
+      "key": "network.speed_limit",
+      "page": "Network",
+      "label": "Speed limit",
+      "type": "number",
+      "options": {
+        "off": true,
+        "unit": "MB/s"
+      },
+      "default": "off",
+      "platform": "both",
+      "priority": "P1",
+      "note": ""
+    },
+    {
+      "key": "display.speed_units",
+      "page": "Display",
+      "label": "Speed units",
+      "type": "enum",
+      "options": [
+        "MBps",
+        "Mbps"
+      ],
+      "default": "MBps",
+      "platform": "both",
+      "priority": "P0",
+      "note": ""
+    },
+    {
+      "key": "notifications.enabled",
+      "page": "Notifications",
+      "label": "Show toasts or notifications",
+      "type": "bool",
+      "options": [
+        true,
+        false
+      ],
+      "default": true,
+      "platform": "both",
+      "priority": "P0",
+      "note": ""
+    },
+    {
+      "key": "notifications.completion_sound",
+      "page": "Notifications",
+      "label": "Completion sound",
+      "type": "bool",
+      "options": [
+        true,
+        false
+      ],
+      "default": false,
+      "platform": "both",
+      "priority": "P0",
+      "note": ""
+    },
+    {
+      "key": "history.retention",
+      "page": "History",
+      "label": "Keep history",
+      "type": "enum",
+      "options": [
+        "30d",
+        "90d",
+        "forever"
+      ],
+      "default": "90d",
+      "platform": "both",
+      "priority": "P0",
+      "note": ""
+    },
+    {
+      "key": "storage.partial_retention_days",
+      "page": "Storage",
+      "label": "Keep partial transfers",
+      "type": "int",
+      "options": {
+        "min": 1,
+        "max": "PARTIAL_RETENTION_DAYS"
+      },
+      "default": "PARTIAL_RETENTION_DAYS",
+      "platform": "both",
+      "priority": "P0",
+      "note": ""
+    },
+    {
+      "key": "diagnostics.log_level",
+      "page": "Diagnostics",
+      "label": "Log level",
+      "type": "enum",
+      "options": [
+        "error",
+        "info",
+        "debug"
+      ],
+      "default": "info",
+      "platform": "both",
+      "priority": "P0",
+      "note": ""
+    }
+  ]
+}

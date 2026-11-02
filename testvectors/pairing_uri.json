@@ -1,0 +1,14 @@
+{
+  "qr_uri_example": "lanvault://pair?v=1&fp=6162c8635dcc5690c3b07d716b771ddc6d70f0dceb54d935cc628d45e2962ded&ip=192.168.1.8,192.168.137.1&port=47800&name=OFFICE-PC&tok=AAECAwQFBgcICQoLDA0ODw",
+  "expected": {
+    "v": "1",
+    "fp": "6162c8635dcc5690c3b07d716b771ddc6d70f0dceb54d935cc628d45e2962ded",
+    "ip": [
+      "192.168.1.8",
+      "192.168.137.1"
+    ],
+    "port": 47800,
+    "name": "OFFICE-PC",
+    "tok_bytes": 16
+  }
+}

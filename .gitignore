@@ -1,0 +1,60 @@
+# Binaries and build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.bin
+build/
+bin/
+
+# Temporary and backup files
+*.tmp
+*.bak
+*.swp
+*~
+*.lvpart
+
+# Go
+core/coverage.out
+*.test
+
+# Wails / Desktop frontend
+desktop/build/bin/
+desktop/frontend/node_modules/
+desktop/frontend/dist/
+desktop/frontend/.eslintcache
+
+# Android
+android/.gradle/
+android/local.properties
+android/.idea/
+android/*.iml
+android/app/*.iml
+android/build/
+android/app/build/
+android/captures/
+android/.externalNativeBuild/
+android/.cxx/
+*.apk
+*.aab
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# OS generated files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+[Dd]esktop.ini
+
+# IDE and Editor files
+.vscode/
+*.ipr
+*.iws
+
+# Specification archives / unzipped temp folders
+LANVault_Fixed_Specifications_v1.2/

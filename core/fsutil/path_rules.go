@@ -3,6 +3,8 @@ package fsutil
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -313,3 +315,24 @@ func PlanSingle(path string, profile string) (finalPath string, rejectReason str
 	}
 	return "", "", nil
 }
+
+// AvailableDiskFilename returns fullPath if it does not exist on disk, or appends " (1)", " (2)", etc. before the extension
+func AvailableDiskFilename(fullPath string) string {
+	if _, err := os.Lstat(fullPath); errors.Is(err, os.ErrNotExist) {
+		return fullPath
+	}
+	dir := filepath.Dir(fullPath)
+	base := filepath.Base(fullPath)
+	ext := filepath.Ext(base)
+	name := strings.TrimSuffix(base, ext)
+
+	for i := 1; i < 10000; i++ {
+		candName := fmt.Sprintf("%s (%d)%s", name, i, ext)
+		candPath := filepath.Join(dir, candName)
+		if _, err := os.Lstat(candPath); errors.Is(err, os.ErrNotExist) {
+			return candPath
+		}
+	}
+	return fullPath
+}
+

@@ -4,9 +4,11 @@ import android.content.Context
 import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Environment
+import android.os.ParcelFileDescriptor
 import androidx.documentfile.provider.DocumentFile
 import com.example.lanvault.crypto.DeviceIdentity
 import com.example.lanvault.crypto.IdentityManager
+import com.example.lanvault.data.TrustedDevice
 import com.example.lanvault.data.VaultDatabase
 import com.example.lanvault.protocol.*
 import kotlinx.coroutines.*
@@ -14,10 +16,16 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.*
 import java.net.ServerSocket
+import java.net.URLEncoder
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
+import java.security.SecureRandom
+import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import javax.net.ssl.SSLServerSocket
 import javax.net.ssl.SSLSocket
 
@@ -31,6 +39,46 @@ data class TransferProgress(
     val speedBps: Long
 )
 
+data class SendSource(
+    val name: String,
+    val size: Long,
+    val mtime: Long = System.currentTimeMillis(),
+    val isDirectory: Boolean = false,
+    val file: File? = null,
+    val uri: Uri? = null
+)
+
+interface ChunkWriter {
+    fun writeChunk(offset: Long, data: ByteArray)
+    fun syncAndClose()
+}
+
+class FileChunkWriter(private val file: File) : ChunkWriter {
+    private val raf = RandomAccessFile(file, "rw")
+    override fun writeChunk(offset: Long, data: ByteArray) {
+        synchronized(raf) {
+            raf.seek(offset)
+            raf.write(data)
+        }
+    }
+    override fun syncAndClose() {
+        try { raf.fd.sync() } catch (_: Exception) {}
+        try { raf.close() } catch (_: Exception) {}
+    }
+}
+
+class SafChunkWriter(private val pfd: ParcelFileDescriptor) : ChunkWriter {
+    override fun writeChunk(offset: Long, data: ByteArray) {
+        synchronized(pfd) {
+            android.system.Os.pwrite(pfd.fileDescriptor, data, 0, data.size, offset)
+        }
+    }
+    override fun syncAndClose() {
+        try { android.system.Os.fsync(pfd.fileDescriptor) } catch (_: Exception) {}
+        try { pfd.close() } catch (_: Exception) {}
+    }
+}
+
 class TransferEngine(
     private val context: Context,
     private val identity: DeviceIdentity
@@ -38,46 +86,82 @@ class TransferEngine(
     private var serverJob: Job? = null
     private var serverSocket: ServerSocket? = null
 
+    data class ActivePairingSession(
+        val token: ByteArray,
+        val tokenB64: String,
+        val createdAt: Long = System.currentTimeMillis(),
+        var attempts: Int = 0
+    )
+
+    @Volatile
+    var activePairing: ActivePairingSession? = null
+
     private data class IncomingTransferSession(
         val transferId: String,
         val peerName: String,
         val peerFp: String,
+        val streamToken: String,
+        val chunkSize: Long,
         val entries: List<ManifestEntry>,
         val totalBytes: Long,
+        val writers: Map<Int, ChunkWriter>,
+        val bitmaps: Map<Int, ChunkBitmap>,
         val targetFiles: Map<Int, File> = emptyMap(),
         val partFiles: Map<Int, File> = emptyMap(),
         val safPartDocs: Map<Int, DocumentFile> = emptyMap(),
         val safFinalNames: Map<Int, String> = emptyMap(),
         val safParentDocs: Map<Int, DocumentFile> = emptyMap(),
-        val openFiles: Map<Int, OutputStream>,
         val controlOutput: OutputStream,
-        var bytesReceived: Long = 0L,
+        val bytesReceived: AtomicLong = AtomicLong(0L),
+        val filesCompleted: AtomicInteger = AtomicInteger(0),
         val startTime: Long = System.currentTimeMillis()
     ) {
         @Volatile
         private var isCompleted = false
 
+        fun isAllComplete(): Boolean {
+            for (entry in entries) {
+                if (entry.type != "file" || entry.size == 0L) continue
+                val bmp = bitmaps[entry.index]
+                if (bmp == null || !bmp.isComplete()) {
+                    return false
+                }
+            }
+            return true
+        }
+
         fun completeTransfer(context: Context) {
             if (isCompleted) return
             isCompleted = true
-            for ((_, stream) in openFiles) {
-                try { stream.close() } catch (_: Exception) {}
+
+            // Flush and close all writers
+            for ((_, writer) in writers) {
+                try { writer.syncAndClose() } catch (_: Exception) {}
             }
+
+            // Finalize SAF documents (atomic non-replace rename with collision suffixing)
             for ((idx, partDoc) in safPartDocs) {
-                val finalName = safFinalNames[idx] ?: continue
+                val desiredName = safFinalNames[idx] ?: continue
                 val parentDoc = safParentDocs[idx]
                 try {
-                    parentDoc?.findFile(finalName)?.delete()
+                    val finalName = getAvailableSafName(parentDoc, desiredName)
                     partDoc.renameTo(finalName)
                 } catch (_: Exception) {}
             }
+
+            // Finalize standard files (atomic collision-safe rename)
             val completedPaths = mutableListOf<String>()
             for ((idx, part) in partFiles) {
                 val target = targetFiles[idx]
                 if (part.exists() && target != null) {
                     try {
-                        part.renameTo(target)
-                        completedPaths.add(target.absolutePath)
+                        val availableTarget = getAvailableFile(target)
+                        part.renameTo(availableTarget)
+                        val entry = entries.find { it.index == idx }
+                        if (entry != null && entry.mtimeMs > 0) {
+                            availableTarget.setLastModified(entry.mtimeMs)
+                        }
+                        completedPaths.add(availableTarget.absolutePath)
                     } catch (_: Exception) {}
                 }
             }
@@ -90,8 +174,8 @@ class TransferEngine(
 
         fun cleanupTransfer() {
             if (isCompleted) return
-            for ((_, stream) in openFiles) {
-                try { stream.close() } catch (_: Exception) {}
+            for ((_, writer) in writers) {
+                try { writer.syncAndClose() } catch (_: Exception) {}
             }
             for ((_, partDoc) in safPartDocs) {
                 try { partDoc.delete() } catch (_: Exception) {}
@@ -99,6 +183,30 @@ class TransferEngine(
             for ((_, part) in partFiles) {
                 try { if (part.exists()) part.delete() } catch (_: Exception) {}
             }
+        }
+
+        private fun getAvailableFile(target: File): File {
+            if (!target.exists()) return target
+            val parent = target.parentFile
+            val name = target.nameWithoutExtension
+            val ext = target.extension
+            val extWithDot = if (ext.isNotEmpty()) ".$ext" else ""
+            for (i in 1..9999) {
+                val candidate = File(parent, "$name ($i)$extWithDot")
+                if (!candidate.exists()) return candidate
+            }
+            return target
+        }
+
+        private fun getAvailableSafName(parentDoc: DocumentFile?, desiredName: String): String {
+            if (parentDoc == null || parentDoc.findFile(desiredName) == null) return desiredName
+            val nameWithoutExt = desiredName.substringBeforeLast('.')
+            val ext = if (desiredName.contains('.')) "." + desiredName.substringAfterLast('.') else ""
+            for (i in 1..9999) {
+                val candidate = "$nameWithoutExt ($i)$ext"
+                if (parentDoc.findFile(candidate) == null) return candidate
+            }
+            return desiredName
         }
     }
 
@@ -108,6 +216,109 @@ class TransferEngine(
     var onProgress: ((TransferProgress) -> Unit)? = null
     var onCompleted: ((transferId: String) -> Unit)? = null
     var onError: ((transferId: String, error: String) -> Unit)? = null
+
+    fun generatePairingQR(localIps: List<String>, deviceName: String): String {
+        val tokenBytes = ByteArray(16)
+        SecureRandom().nextBytes(tokenBytes)
+        val tokenB64 = Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes)
+        activePairing = ActivePairingSession(tokenBytes, tokenB64)
+        val ipStr = localIps.joinToString(",")
+        val encodedName = URLEncoder.encode(deviceName, "UTF-8")
+        return "lanvault://pair?v=1&fp=${identity.fingerprint}&ip=$ipStr&port=${Protocol.DEFAULT_PORT}&name=$encodedName&tok=$tokenB64"
+    }
+
+    suspend fun pairWithPeer(qrText: String): Result<String> = withContext(Dispatchers.IO) {
+        try {
+            val uri = Uri.parse(qrText)
+            val fp = uri.getQueryParameter("fp") ?: return@withContext Result.failure(IOException("Missing fp in QR URI"))
+            val ipStr = uri.getQueryParameter("ip") ?: return@withContext Result.failure(IOException("Missing ip in QR URI"))
+            val port = uri.getQueryParameter("port")?.toIntOrNull() ?: Protocol.DEFAULT_PORT
+            val name = uri.getQueryParameter("name") ?: "LANVault Peer"
+            val tok = uri.getQueryParameter("tok") ?: return@withContext Result.failure(IOException("Missing tok in QR URI"))
+            val ips = ipStr.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+
+            var connectedSocket: SSLSocket? = null
+            var lastErr: Exception? = null
+
+            val sslContext = IdentityManager.createSSLContext(identity, fp)
+            val sf = sslContext.socketFactory
+
+            for (ip in ips) {
+                try {
+                    val s = sf.createSocket(ip, port) as SSLSocket
+                    s.startHandshake()
+                    connectedSocket = s
+                    break
+                } catch (e: Exception) {
+                    lastErr = e
+                }
+            }
+            val socket = connectedSocket ?: throw (lastErr ?: IOException("Failed to connect to pairing target on $ipStr"))
+            val input = socket.inputStream
+            val output = socket.outputStream
+
+            try {
+                // 1. Send HELLO
+                val helloJson = JSONObject().apply {
+                    put("version", JSONObject().apply {
+                        put("major", Protocol.MAJOR_VERSION)
+                        put("minor", Protocol.MINOR_VERSION)
+                    })
+                    put("device_id", identity.deviceId)
+                    put("name", "Android Phone")
+                    put("platform", "android")
+                    put("role", "control")
+                    put("capabilities", JSONArray().put("resume").put("multi-stream"))
+                }.toString()
+                Framing.writeJSONFrame(output, Protocol.FRAME_HELLO, helloJson)
+
+                // 2. Read HELLO_OK
+                val hOk = Framing.readFrame(input)
+                if (hOk.type != Protocol.FRAME_HELLO_OK) {
+                    throw IOException("Expected HELLO_OK, got ${hOk.type}")
+                }
+
+                // 3. Send PAIR_REQUEST
+                val pairReq = JSONObject().apply {
+                    put("token", tok)
+                    put("name", "Android Phone")
+                    put("platform", "android")
+                }.toString()
+                Framing.writeJSONFrame(output, Protocol.FRAME_PAIR_REQUEST, pairReq)
+
+                // 4. Read PAIR_OK or ERROR
+                val resp = Framing.readFrame(input)
+                if (resp.type == Protocol.FRAME_PAIR_OK) {
+                    val respJson = JSONObject(resp.payloadAsString())
+                    val peerDevId = respJson.optString("device_id", fp.take(32))
+                    val peerDevName = respJson.optString("name", name)
+
+                    val db = VaultDatabase(context)
+                    db.addTrustedDevice(
+                        TrustedDevice(
+                            fingerprint = fp,
+                            deviceId = peerDevId,
+                            name = peerDevName,
+                            platform = "remote",
+                            pairedAt = System.currentTimeMillis(),
+                            lastSeen = System.currentTimeMillis(),
+                            lastKnownIp = ips.firstOrNull() ?: ""
+                        )
+                    )
+                    Result.success(peerDevName)
+                } else if (resp.type == Protocol.FRAME_ERROR) {
+                    val errJson = JSONObject(resp.payloadAsString())
+                    Result.failure(IOException("Pairing failed: ${errJson.optString("message")}"))
+                } else {
+                    Result.failure(IOException("Unexpected pairing response frame: ${resp.type}"))
+                }
+            } finally {
+                try { socket.close() } catch (_: Exception) {}
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
 
     fun startServer(scope: CoroutineScope) {
         if (serverJob != null) return
@@ -125,9 +336,7 @@ class TransferEngine(
                         handleIncomingConnection(clientSocket)
                     }
                 }
-            } catch (e: Exception) {
-                // Log and allow clean recovery
-            }
+            } catch (_: Exception) {}
         }
     }
 
@@ -138,9 +347,7 @@ class TransferEngine(
             serverSocket?.close()
         } catch (_: Exception) {}
         for ((_, session) in activeIncoming) {
-            for ((_, fos) in session.openFiles) {
-                try { fos.close() } catch (_: Exception) {}
-            }
+            session.cleanupTransfer()
         }
         activeIncoming.clear()
     }
@@ -150,7 +357,7 @@ class TransferEngine(
             socket.startHandshake()
             val certs = socket.session.peerCertificates
             val peerCert = certs.firstOrNull() as? java.security.cert.X509Certificate
-                ?: throw IOException("No peer certificate")
+                ?: throw IOException("No peer certificate provided")
             val peerFp = IdentityManager.computeFingerprint(peerCert)
 
             val input = socket.inputStream
@@ -166,6 +373,7 @@ class TransferEngine(
             val peerName = helloJson.optString("name", "LANVault Peer")
             val role = helloJson.optString("role", "control")
             val dataTransferId = helloJson.optString("transfer_id", "")
+            val streamToken = helloJson.optString("stream_token", "")
 
             // Reply HELLO_OK
             val helloOkJson = JSONObject().apply {
@@ -181,20 +389,120 @@ class TransferEngine(
             Framing.writeJSONFrame(output, Protocol.FRAME_HELLO_OK, helloOkJson)
 
             if (role == "data") {
-                // Handle DATA stream
-                handleDataStream(dataTransferId, input, output)
+                // Route DATA stream with strict token and peer fingerprint validation
+                val session = activeIncoming[dataTransferId]
+                if (session == null || session.streamToken != streamToken || session.peerFp != peerFp) {
+                    val errJson = JSONObject().apply {
+                        put("code", Protocol.ERR_PROTOCOL_ERROR)
+                        put("message", "Invalid data connection credentials")
+                        put("fatal", true)
+                    }.toString()
+                    Framing.writeJSONFrame(output, Protocol.FRAME_ERROR, errJson)
+                    socket.close()
+                    return@withContext
+                }
+                handleDataStream(session, input, output)
                 return@withContext
             }
 
-            // 2. Control Stream: Read OFFER
-            val offerFrame = Framing.readFrame(input)
-            if (offerFrame.type != Protocol.FRAME_OFFER) {
-                throw IOException("Expected OFFER frame (0x10), got ${offerFrame.type}")
+            // 2. Control Stream: Read next frame (OFFER or PAIR_REQUEST)
+            val nextFrame = Framing.readFrame(input)
+            if (nextFrame.type == Protocol.FRAME_PAIR_REQUEST) {
+                val pairJson = JSONObject(nextFrame.payloadAsString())
+                val receivedTok = pairJson.getString("token")
+                val peerReqName = pairJson.optString("name", "LANVault Peer")
+                val peerReqPlat = pairJson.optString("platform", "remote")
+
+                val pairingSession = activePairing
+                val now = System.currentTimeMillis()
+                if (pairingSession == null || (now - pairingSession.createdAt) > Protocol.PAIR_TOKEN_TTL_S * 1000L || pairingSession.attempts >= Protocol.PAIR_MAX_FAILED_ATTEMPTS) {
+                    activePairing = null
+                    val errJson = JSONObject().apply {
+                        put("code", Protocol.ERR_PAIR_TOKEN_INVALID)
+                        put("message", "Pairing token expired or invalid")
+                        put("fatal", true)
+                    }.toString()
+                    Framing.writeJSONFrame(output, Protocol.FRAME_ERROR, errJson)
+                    socket.close()
+                    return@withContext
+                }
+
+                if (!MessageDigest.isEqual(receivedTok.toByteArray(StandardCharsets.UTF_8), pairingSession.tokenB64.toByteArray(StandardCharsets.UTF_8))) {
+                    pairingSession.attempts++
+                    val errJson = JSONObject().apply {
+                        put("code", Protocol.ERR_PAIR_TOKEN_INVALID)
+                        put("message", "Pairing token mismatch")
+                        put("fatal", true)
+                    }.toString()
+                    Framing.writeJSONFrame(output, Protocol.FRAME_ERROR, errJson)
+                    socket.close()
+                    return@withContext
+                }
+
+                // Token is valid! Invalidate single-use token
+                activePairing = null
+                val db = VaultDatabase(context)
+                db.addTrustedDevice(
+                    TrustedDevice(
+                        fingerprint = peerFp,
+                        deviceId = helloJson.optString("device_id", peerFp.take(32)),
+                        name = peerReqName,
+                        platform = peerReqPlat,
+                        pairedAt = System.currentTimeMillis(),
+                        lastSeen = System.currentTimeMillis()
+                    )
+                )
+
+                val pairOkJson = JSONObject().apply {
+                    put("device_id", identity.deviceId)
+                    put("name", db.getSetting("device_name", "Android Phone"))
+                }.toString()
+                Framing.writeJSONFrame(output, Protocol.FRAME_PAIR_OK, pairOkJson)
+                socket.close()
+                return@withContext
             }
-            val offerJson = JSONObject(offerFrame.payloadAsString())
+
+            if (nextFrame.type != Protocol.FRAME_OFFER) {
+                throw IOException("Expected OFFER frame (0x10), got ${nextFrame.type}")
+            }
+
+            val offerJson = JSONObject(nextFrame.payloadAsString())
             val transferId = offerJson.getString("transfer_id")
+            val chunkSize = offerJson.optLong("chunk_size", Protocol.CHUNK_SIZE_DEFAULT.toLong())
             val totalBytes = offerJson.optLong("total_bytes", 0L)
             val fileCount = offerJson.optInt("file_count", 0)
+
+            // Validate OFFER parameters per specification
+            if (chunkSize < Protocol.CHUNK_SIZE_MIN || chunkSize > Protocol.CHUNK_SIZE_MAX) {
+                val errJson = JSONObject().apply {
+                    put("code", Protocol.ERR_PROTOCOL_ERROR)
+                    put("message", "chunk_size $chunkSize out of bounds")
+                    put("fatal", true)
+                }.toString()
+                Framing.writeJSONFrame(output, Protocol.FRAME_ERROR, errJson)
+                socket.close()
+                return@withContext
+            }
+            if (fileCount < 0 || fileCount > Protocol.MAX_MANIFEST_ENTRIES) {
+                val errJson = JSONObject().apply {
+                    put("code", Protocol.ERR_PATH_INVALID)
+                    put("message", "file_count $fileCount out of bounds")
+                    put("fatal", true)
+                }.toString()
+                Framing.writeJSONFrame(output, Protocol.FRAME_ERROR, errJson)
+                socket.close()
+                return@withContext
+            }
+            if (totalBytes < 0) {
+                val errJson = JSONObject().apply {
+                    put("code", Protocol.ERR_PROTOCOL_ERROR)
+                    put("message", "total_bytes cannot be negative")
+                    put("fatal", true)
+                }.toString()
+                Framing.writeJSONFrame(output, Protocol.FRAME_ERROR, errJson)
+                socket.close()
+                return@withContext
+            }
 
             // 3. Read MANIFEST_PART frames until MANIFEST_END
             val entries = mutableListOf<ManifestEntry>()
@@ -238,7 +546,7 @@ class TransferEngine(
             if (!accepted) {
                 val rejectJson = JSONObject().apply {
                     put("transfer_id", transferId)
-                    put("code", 1)
+                    put("code", Protocol.ERR_REJECTED)
                     put("message", "Declined by user")
                 }.toString()
                 Framing.writeJSONFrame(output, Protocol.FRAME_REJECT, rejectJson)
@@ -246,7 +554,7 @@ class TransferEngine(
                 return@withContext
             }
 
-            // 5. Pre-create save directories and files (SAF or File fallback)
+            // 5. Pre-create save directories, files, and random-access chunk writers
             val db = VaultDatabase(context)
             val treeUriStr = db.getSetting("save_tree_uri", "")
             var safRoot: DocumentFile? = null
@@ -265,10 +573,10 @@ class TransferEngine(
             val safPartDocs = mutableMapOf<Int, DocumentFile>()
             val safFinalNames = mutableMapOf<Int, String>()
             val safParentDocs = mutableMapOf<Int, DocumentFile>()
-            val openFiles = mutableMapOf<Int, OutputStream>()
+            val writers = mutableMapOf<Int, ChunkWriter>()
+            val bitmaps = mutableMapOf<Int, ChunkBitmap>()
 
             if (safRoot != null) {
-                // User-selected SAF folder
                 for (entry in entries) {
                     val sanitized = entry.path.replace("..", "").replace("\\", "/").trimStart('/')
                     if (entry.type == "dir") {
@@ -284,17 +592,19 @@ class TransferEngine(
                         parentDoc.findFile(partName)?.delete()
                         val partDoc = parentDoc.createFile("application/octet-stream", partName)
                             ?: throw IOException("Failed to create file $fileName in selected directory")
-                        val outStream = context.contentResolver.openOutputStream(partDoc.uri, "wt")
-                            ?: throw IOException("Failed to open stream for $fileName")
 
+                        val pfd = context.contentResolver.openFileDescriptor(partDoc.uri, "rw")
+                            ?: throw IOException("Failed to open file descriptor for $fileName")
+
+                        val numChunks = if (entry.size == 0L) 0 else ((entry.size + chunkSize - 1) / chunkSize).toInt()
                         safPartDocs[entry.index] = partDoc
                         safFinalNames[entry.index] = fileName
                         safParentDocs[entry.index] = parentDoc
-                        openFiles[entry.index] = outStream
+                        writers[entry.index] = SafChunkWriter(pfd)
+                        bitmaps[entry.index] = ChunkBitmap(numChunks)
                     }
                 }
             } else {
-                // Fallback: Downloads/LANVault
                 var saveDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "LANVault")
                 if (!saveDir.exists() && !saveDir.mkdirs()) {
                     saveDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: File(context.filesDir, "LANVault")
@@ -309,40 +619,51 @@ class TransferEngine(
                     } else {
                         target.parentFile?.mkdirs()
                         val part = File(saveDir, "$sanitized.lvpart")
+                        if (part.exists()) part.delete()
+
+                        val numChunks = if (entry.size == 0L) 0 else ((entry.size + chunkSize - 1) / chunkSize).toInt()
                         targetFiles[entry.index] = target
                         partFiles[entry.index] = part
-                        openFiles[entry.index] = FileOutputStream(part)
+                        writers[entry.index] = FileChunkWriter(part)
+                        bitmaps[entry.index] = ChunkBitmap(numChunks)
                     }
                 }
             }
+
+            // Cryptographically secure 16-byte random stream token
+            val tokenBytes = ByteArray(16)
+            SecureRandom().nextBytes(tokenBytes)
+            val streamTokenGenerated = Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes)
 
             val session = IncomingTransferSession(
                 transferId = transferId,
                 peerName = peerName,
                 peerFp = peerFp,
+                streamToken = streamTokenGenerated,
+                chunkSize = chunkSize,
                 entries = entries,
                 totalBytes = totalBytes,
+                writers = writers,
+                bitmaps = bitmaps,
                 targetFiles = targetFiles,
                 partFiles = partFiles,
                 safPartDocs = safPartDocs,
                 safFinalNames = safFinalNames,
                 safParentDocs = safParentDocs,
-                openFiles = openFiles,
                 controlOutput = output
             )
             activeIncoming[transferId] = session
 
             // Send ACCEPT
-            val streamToken = java.util.UUID.randomUUID().toString().replace("-", "").take(16)
             val acceptJson = JSONObject().apply {
                 put("transfer_id", transferId)
                 put("resume", false)
-                put("stream_token", streamToken)
+                put("stream_token", streamTokenGenerated)
                 put("data_streams", 1)
             }.toString()
             Framing.writeJSONFrame(output, Protocol.FRAME_ACCEPT, acceptJson)
 
-            // Read control connection frames (e.g. DONE, CANCEL) until transfer finishes
+            // Read control connection frames until transfer finishes
             while (activeIncoming.containsKey(transferId)) {
                 val ctrlFrame = try {
                     Framing.readFrame(input)
@@ -350,26 +671,35 @@ class TransferEngine(
                     break
                 }
                 if (ctrlFrame.type == Protocol.FRAME_DONE) {
-                    session.completeTransfer(context)
-                    val doneOkJson = JSONObject().apply {
-                        put("transfer_id", session.transferId)
-                        put("files_completed", session.entries.size)
-                        put("bytes", session.bytesReceived)
-                    }.toString()
-                    try {
+                    if (session.isAllComplete()) {
+                        session.completeTransfer(context)
+                        val doneOkJson = JSONObject().apply {
+                            put("transfer_id", session.transferId)
+                            put("files_completed", session.entries.count { it.type == "file" })
+                            put("bytes", session.bytesReceived.get())
+                        }.toString()
                         Framing.writeJSONFrame(output, Protocol.FRAME_DONE_OK, doneOkJson)
-                    } catch (_: Exception) {}
-                    activeIncoming.remove(session.transferId)
-                    onCompleted?.invoke(session.transferId)
+                        activeIncoming.remove(session.transferId)
+                        onCompleted?.invoke(session.transferId)
+                    } else {
+                        val errJson = JSONObject().apply {
+                            put("code", Protocol.ERR_STATE_INTEGRITY)
+                            put("message", "DONE received before all chunks completed")
+                            put("fatal", true)
+                        }.toString()
+                        Framing.writeJSONFrame(output, Protocol.FRAME_ERROR, errJson)
+                        activeIncoming.remove(session.transferId)
+                    }
                     break
-                } else if (ctrlFrame.type == Protocol.FRAME_ERROR) {
+                } else if (ctrlFrame.type == Protocol.FRAME_CANCEL) {
                     session.cleanupTransfer()
                     activeIncoming.remove(session.transferId)
+                    onError?.invoke(session.transferId, "Transfer cancelled by sender")
                     break
                 }
             }
         } catch (e: Exception) {
-            onError?.invoke("", e.message ?: "Transfer error")
+            onError?.invoke("", e.message ?: "Incoming connection error")
         } finally {
             try { socket.close() } catch (_: Exception) {}
         }
@@ -389,40 +719,42 @@ class TransferEngine(
         return current
     }
 
-    private fun handleDataStream(transferId: String, input: InputStream, output: OutputStream) {
-        val session = activeIncoming[transferId] ?: activeIncoming.values.firstOrNull()
-        if (session == null) {
-            return
-        }
-
+    private fun handleDataStream(session: IncomingTransferSession, input: InputStream, output: OutputStream) {
         try {
             while (true) {
                 val frame = Framing.readFrame(input)
                 if (frame.type == Protocol.FRAME_DONE) {
-                    session.completeTransfer(context)
+                    if (session.isAllComplete()) {
+                        session.completeTransfer(context)
 
-                    // Send DONE_OK to control and data streams
-                    val doneOkJson = JSONObject().apply {
-                        put("transfer_id", session.transferId)
-                        put("files_completed", session.entries.size)
-                        put("bytes", session.bytesReceived)
-                    }.toString()
-                    try {
-                        Framing.writeJSONFrame(session.controlOutput, Protocol.FRAME_DONE_OK, doneOkJson)
-                    } catch (_: Exception) {}
-                    try {
-                        Framing.writeJSONFrame(output, Protocol.FRAME_DONE_OK, doneOkJson)
-                    } catch (_: Exception) {}
+                        val doneOkJson = JSONObject().apply {
+                            put("transfer_id", session.transferId)
+                            put("files_completed", session.entries.count { it.type == "file" })
+                            put("bytes", session.bytesReceived.get())
+                        }.toString()
+                        try {
+                            Framing.writeJSONFrame(session.controlOutput, Protocol.FRAME_DONE_OK, doneOkJson)
+                        } catch (_: Exception) {}
+                        try {
+                            Framing.writeJSONFrame(output, Protocol.FRAME_DONE_OK, doneOkJson)
+                        } catch (_: Exception) {}
 
-                    activeIncoming.remove(session.transferId)
-                    onCompleted?.invoke(session.transferId)
+                        activeIncoming.remove(session.transferId)
+                        onCompleted?.invoke(session.transferId)
+                    } else {
+                        val errJson = JSONObject().apply {
+                            put("code", Protocol.ERR_STATE_INTEGRITY)
+                            put("message", "DONE received before all chunks completed")
+                            put("fatal", true)
+                        }.toString()
+                        try { Framing.writeJSONFrame(output, Protocol.FRAME_ERROR, errJson) } catch (_: Exception) {}
+                    }
                     break
                 }
 
                 if (frame.type == Protocol.FRAME_DATA) {
-                    // Payload format: fileIndex (u32, 4) + chunkIndex (u32, 4) + data (N) + sha256 (32)
                     val p = frame.payload
-                    if (p.size >= 40) {
+                    if (p.size >= Protocol.DATA_FRAME_OVERHEAD) {
                         val bb = ByteBuffer.wrap(p, 0, 8).order(ByteOrder.BIG_ENDIAN)
                         val fileIdx = bb.int
                         val chunkIdx = bb.int
@@ -432,36 +764,57 @@ class TransferEngine(
 
                         val actualHash = MessageDigest.getInstance("SHA-256").digest(data)
                         if (actualHash.contentEquals(expectedHash)) {
-                            val fos = session.openFiles[fileIdx]
-                            if (fos != null) {
-                                fos.write(data)
-                                fos.flush()
-                                session.bytesReceived += dataLen
+                            val writer = session.writers[fileIdx]
+                            val entry = session.entries.find { it.index == fileIdx }
+                            if (writer != null && entry != null) {
+                                val offset = chunkIdx.toLong() * session.chunkSize
+                                writer.writeChunk(offset, data)
+                                session.bitmaps[fileIdx]?.set(chunkIdx)
+                                val currentBytes = session.bytesReceived.addAndGet(dataLen.toLong())
+
+                                // Send CHUNK_ACK on control stream
+                                val ackPayload = Framing.encodeIndexPairs(listOf(Pair(fileIdx, chunkIdx)))
+                                try {
+                                    Framing.writeRawFrame(session.controlOutput, Protocol.FRAME_CHUNK_ACK, ackPayload)
+                                } catch (_: Exception) {}
+
+                                // If file completed, send FILE_DONE
+                                if (session.bitmaps[fileIdx]?.isComplete() == true) {
+                                    session.filesCompleted.incrementAndGet()
+                                    val fileDoneJson = JSONObject().apply {
+                                        put("index", fileIdx)
+                                    }.toString()
+                                    try {
+                                        Framing.writeJSONFrame(session.controlOutput, Protocol.FRAME_FILE_DONE, fileDoneJson)
+                                    } catch (_: Exception) {}
+                                }
 
                                 val elapsed = (System.currentTimeMillis() - session.startTime) / 1000L
-                                val speed = if (elapsed > 0) session.bytesReceived / elapsed else 0L
+                                val speed = if (elapsed > 0) currentBytes / elapsed else 0L
 
                                 onProgress?.invoke(
                                     TransferProgress(
                                         transferId = session.transferId,
                                         direction = "receive",
-                                        bytesAcked = session.bytesReceived,
+                                        bytesAcked = currentBytes,
                                         totalBytes = session.totalBytes,
-                                        filesDone = session.entries.size,
-                                        totalFiles = session.entries.size,
+                                        filesDone = session.filesCompleted.get(),
+                                        totalFiles = session.entries.count { it.type == "file" },
                                         speedBps = speed
                                     )
                                 )
                             }
+                        } else {
+                            // Hash mismatch: request retransmission with CHUNK_NEED
+                            val needPayload = Framing.encodeIndexPairs(listOf(Pair(fileIdx, chunkIdx)))
+                            try {
+                                Framing.writeRawFrame(session.controlOutput, Protocol.FRAME_CHUNK_NEED, needPayload)
+                            } catch (_: Exception) {}
                         }
                     }
                 }
             }
         } catch (_: Exception) {
-            session.cleanupTransfer()
-        } finally {
-            session.cleanupTransfer()
-            activeIncoming.remove(session.transferId)
         }
     }
 
@@ -470,12 +823,38 @@ class TransferEngine(
         targetPort: Int,
         files: List<File>,
         peerFingerprint: String? = null
+    ): String {
+        val sources = files.map { file ->
+            SendSource(
+                name = file.name,
+                size = file.length(),
+                mtime = file.lastModified(),
+                isDirectory = file.isDirectory,
+                file = file
+            )
+        }
+        return startSendSources(targetIp, targetPort, sources, peerFingerprint)
+    }
+
+    suspend fun startSendSources(
+        targetIp: String,
+        targetPort: Int,
+        sources: List<SendSource>,
+        peerFingerprint: String? = null
     ): String = withContext(Dispatchers.IO) {
         val transferId = java.util.UUID.randomUUID().toString().replace("-", "").take(16)
-        val sslContext = IdentityManager.createSSLContext(identity)
+        val sslContext = IdentityManager.createSSLContext(identity, peerFingerprint)
         val sf = sslContext.socketFactory
         val socket = sf.createSocket(targetIp, targetPort) as SSLSocket
         socket.startHandshake()
+
+        val certs = socket.session.peerCertificates
+        val peerCert = certs.firstOrNull() as? java.security.cert.X509Certificate
+            ?: throw IOException("No peer certificate provided by receiver")
+        val actualPeerFp = IdentityManager.computeFingerprint(peerCert)
+        if (!peerFingerprint.isNullOrBlank() && !peerFingerprint.equals(actualPeerFp, ignoreCase = true)) {
+            throw IOException("Peer fingerprint mismatch: expected $peerFingerprint, got $actualPeerFp")
+        }
 
         val input = socket.inputStream
         val output = socket.outputStream
@@ -504,15 +883,15 @@ class TransferEngine(
             // 2. Build entries and manifest hash
             val entries = mutableListOf<ManifestEntry>()
             var totalBytes = 0L
-            files.forEachIndexed { index, file ->
-                totalBytes += file.length()
+            sources.forEachIndexed { index, src ->
+                totalBytes += src.size
                 entries.add(
                     ManifestEntry(
                         index = index,
-                        type = if (file.isDirectory) "dir" else "file",
-                        path = file.name,
-                        size = file.length(),
-                        mtimeMs = file.lastModified()
+                        type = if (src.isDirectory) "dir" else "file",
+                        path = src.name,
+                        size = src.size,
+                        mtimeMs = src.mtime
                     )
                 )
             }
@@ -563,7 +942,7 @@ class TransferEngine(
             val acceptJson = JSONObject(respFrame.payloadAsString())
             val streamToken = acceptJson.optString("stream_token", "")
 
-            // 6. Open parallel Data Connection
+            // 6. Open parallel Data Connection pinned to verified peer cert
             val dataSocket = sf.createSocket(targetIp, targetPort) as SSLSocket
             dataSocket.startHandshake()
             val dataIn = dataSocket.inputStream
@@ -588,19 +967,26 @@ class TransferEngine(
                 throw IOException("Expected HELLO_OK on data connection, got ${dataHelloOk.type}")
             }
 
-            // 7. Stream DATA chunks
-            var bytesAcked = 0L
+            // 7. Stream DATA chunks with ACK tracking
             val chunkSize = Protocol.CHUNK_SIZE_DEFAULT
             val buffer = ByteArray(chunkSize)
             val startTime = System.currentTimeMillis()
+            var bytesAcked = 0L
+            var filesCompletedCount = 0
 
-            for ((fileIdx, file) in files.withIndex()) {
-                if (file.isDirectory || file.length() == 0L) continue
-                val fis = FileInputStream(file)
+            for ((fileIdx, src) in sources.withIndex()) {
+                if (src.isDirectory || src.size == 0L) continue
+                val inputStream = if (src.file != null) {
+                    FileInputStream(src.file)
+                } else if (src.uri != null) {
+                    context.contentResolver.openInputStream(src.uri)
+                } else null
+                if (inputStream == null) continue
+
                 var chunkIdx = 0
                 try {
                     while (true) {
-                        val n = fis.read(buffer)
+                        val n = inputStream.read(buffer)
                         if (n <= 0) break
                         val chunkData = if (n == buffer.size) buffer else buffer.copyOf(n)
                         val payload = Framing.encodeDataFramePayload(fileIdx, chunkIdx, chunkData)
@@ -617,18 +1003,19 @@ class TransferEngine(
                                 direction = "send",
                                 bytesAcked = bytesAcked,
                                 totalBytes = totalBytes,
-                                filesDone = fileIdx,
-                                totalFiles = files.size,
+                                filesDone = filesCompletedCount,
+                                totalFiles = sources.size,
                                 speedBps = speed
                             )
                         )
                     }
+                    filesCompletedCount++
                 } finally {
-                    fis.close()
+                    try { inputStream.close() } catch (_: Exception) {}
                 }
             }
 
-            // 8. Send DONE frame on both data and control connections
+            // 8. Send DONE frame
             val doneJson = JSONObject().apply {
                 put("transfer_id", transferId)
             }.toString()

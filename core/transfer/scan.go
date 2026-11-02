@@ -25,9 +25,13 @@ func ScanSourceItems(itemPaths []string) ([]ScannedItem, int, int64, string, err
 	currentIndex := 0
 
 	for _, p := range itemPaths {
-		info, err := os.Stat(p)
+		info, err := os.Lstat(p)
 		if err != nil {
 			return nil, 0, 0, "", fmt.Errorf("failed to stat %s: %w", p, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			// Skip symlinks to prevent loops and arbitrary file traversal
+			continue
 		}
 
 		if !info.IsDir() {
@@ -56,6 +60,10 @@ func ScanSourceItems(itemPaths []string) ([]ScannedItem, int, int64, string, err
 			err := filepath.WalkDir(p, func(currPath string, d fs.DirEntry, walkErr error) error {
 				if walkErr != nil {
 					return walkErr
+				}
+				if d.Type()&fs.ModeSymlink != 0 {
+					// Never traverse or package symlinks
+					return nil
 				}
 				rel, err := filepath.Rel(baseParent, currPath)
 				if err != nil {

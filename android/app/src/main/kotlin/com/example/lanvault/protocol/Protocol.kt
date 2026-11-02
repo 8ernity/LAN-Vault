@@ -28,14 +28,38 @@ object Protocol {
     const val FRAME_DATA: Byte = 32
     const val FRAME_CHUNK_ACK: Byte = 33
     const val FRAME_FILE_DONE: Byte = 34
+    const val FRAME_CHUNK_NEED: Byte = 35
+    const val FRAME_PAUSE: Byte = 48
+    const val FRAME_RESUME: Byte = 49
+    const val FRAME_CANCEL: Byte = 50
     const val FRAME_DONE: Byte = 64
     const val FRAME_DONE_OK: Byte = 65
+    const val FRAME_PAIR_REQUEST: Byte = 80
+    const val FRAME_PAIR_OK: Byte = 81
     const val FRAME_PING: Byte = 125
     const val FRAME_PONG: Byte = 126
     const val FRAME_ERROR: Byte = 127
 
-    const val MAX_CONTROL_FRAME_SIZE = 1048576 // 1 MiB
-    const val MAX_DATA_FRAME_SIZE = 16777257   // 16 MiB + 41
+    const val MAX_CONTROL_FRAME_SIZE = 1048576L // 1 MiB
+    const val MAX_DATA_FRAME_SIZE = 16777257L   // 16 MiB + 41
+    const val MAX_CONTROL_FRAME = Constants.MAX_CONTROL_FRAME
+    const val MAX_DATA_FRAME = Constants.MAX_DATA_FRAME
+    const val DATA_FRAME_OVERHEAD = Constants.DATA_FRAME_OVERHEAD
+
+    const val CHUNK_SIZE_MIN = Constants.CHUNK_SIZE_MIN
+    const val CHUNK_SIZE_MAX = Constants.CHUNK_SIZE_MAX
+    const val MAX_MANIFEST_ENTRIES = Constants.MAX_MANIFEST_ENTRIES
+    const val PAIR_TOKEN_TTL_S = Constants.PAIR_TOKEN_TTL_S
+    const val PAIR_MAX_FAILED_ATTEMPTS = Constants.PAIR_MAX_FAILED_ATTEMPTS
+    const val OFFER_RESPONSE_TIMEOUT_S = Constants.OFFER_RESPONSE_TIMEOUT_S
+
+    // Error codes from specification
+    const val ERR_PROTOCOL_ERROR = Constants.ERR_PROTOCOL_ERROR
+    const val ERR_PAIR_TOKEN_INVALID = Constants.ERR_PAIR_TOKEN_INVALID
+    const val ERR_PATH_INVALID = Constants.ERR_PATH_INVALID
+    const val ERR_REJECTED = Constants.ERR_REJECTED
+    const val ERR_STATE_INTEGRITY = Constants.ERR_STATE_INTEGRITY
+    const val ERR_DISK_FULL = Constants.ERR_DISK_FULL
 }
 
 data class ManifestEntry(
@@ -68,14 +92,21 @@ object Framing {
             if (n == -1) throw EOFException("Premature EOF reading frame length")
             read += n
         }
-        val totalLength = ByteBuffer.wrap(lenBuf).order(ByteOrder.BIG_ENDIAN).int
-        if (totalLength < 1) throw java.io.IOException("Invalid wire frame length: $totalLength")
+        val totalLengthLong = ByteBuffer.wrap(lenBuf).order(ByteOrder.BIG_ENDIAN).int.toLong() and 0xFFFFFFFFL
+        if (totalLengthLong < 1L || totalLengthLong > Protocol.MAX_DATA_FRAME) {
+            throw java.io.IOException("Wire frame length out of bounds: $totalLengthLong (max ${Protocol.MAX_DATA_FRAME})")
+        }
 
         val typeInt = stream.read()
         if (typeInt == -1) throw EOFException("Premature EOF reading frame type")
         val type = typeInt.toByte()
 
-        val payloadLen = totalLength - 1
+        // Control frames cannot exceed MAX_CONTROL_FRAME
+        if (type != Protocol.FRAME_DATA && totalLengthLong > Protocol.MAX_CONTROL_FRAME) {
+            throw java.io.IOException("Control frame length exceeds limit: $totalLengthLong > ${Protocol.MAX_CONTROL_FRAME}")
+        }
+
+        val payloadLen = (totalLengthLong - 1L).toInt()
         val payload = ByteArray(payloadLen)
         var pRead = 0
         while (pRead < payloadLen) {
@@ -136,5 +167,24 @@ object Framing {
             md.update(record.toByteArray(StandardCharsets.UTF_8))
         }
         return toHex(md.digest())
+    }
+
+    fun encodeIndexPairs(pairs: List<Pair<Int, Int>>): ByteArray {
+        val buf = ByteBuffer.allocate(pairs.size * 8).order(ByteOrder.BIG_ENDIAN)
+        for ((fileIdx, chunkIdx) in pairs) {
+            buf.putInt(fileIdx)
+            buf.putInt(chunkIdx)
+        }
+        return buf.array()
+    }
+
+    fun decodeIndexPairs(payload: ByteArray): List<Pair<Int, Int>> {
+        val pairs = mutableListOf<Pair<Int, Int>>()
+        val count = payload.size / 8
+        val buf = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+        for (i in 0 until count) {
+            pairs.add(Pair(buf.int, buf.int))
+        }
+        return pairs
     }
 }

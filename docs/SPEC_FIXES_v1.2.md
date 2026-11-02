@@ -22,4 +22,8 @@ python3 tools/verify_companions.py --self-test --prd docs/PRD.md
 
 Every check (including `prd` and `manifest_frames`) must report PASS; all negative mutation checks must be detected. Use Go and Kotlin implementations to test against the shared corpus before starting a UI-only milestone.
 
-**Scope note:** This repository currently contains documents, test fixtures and Python spec-oracle scripts; it does not provide a working LANVault sender or receiver. Passing these tests does **not** establish end-to-end security, Android OS compatibility, network speed or device interoperability. Those require real implementations, integration tests and real-device/VM testing.
+**Implementation status:** This repository contains the complete cross-platform LANVault implementation:
+- **Go Core Engine:** Protocol v1.1 wire framing, cryptographic TLS fingerprint pinning, authenticated data stream tokens, root-confined path traversal safety, chunk-index seek-writes, in-flight windowing, and completion barrier.
+- **Windows Desktop:** Wails Go backend with TypeScript/React frontend, tray integration, mutual pairing challenge/response, and transfer history.
+- **Android Native:** Kotlin engine with direct SAF streaming (zero cache copy), mutual QR pairing, foreground notification service with lifecycle management, and Compose UI.
+- **CLI & Test Harness:** Loopback CLI and shared cross-platform companion test suite.

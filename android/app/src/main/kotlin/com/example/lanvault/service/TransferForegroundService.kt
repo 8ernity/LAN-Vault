@@ -35,6 +35,8 @@ class TransferForegroundService : Service() {
     var pendingOffer: IncomingOfferState? = null
         private set
 
+    private var offerTimeoutJob: Job? = null
+
     data class IncomingOfferState(
         val transferId: String,
         val peerName: String,
@@ -55,6 +57,16 @@ class TransferForegroundService : Service() {
             onIncomingOffer = { id, name, fp, count, bytes, cb ->
                 pendingOffer = IncomingOfferState(id, name, fp, count, bytes, cb)
                 showIncomingOfferNotification(name, count, bytes)
+                // Schedule 300s timeout per protocol specification
+                offerTimeoutJob?.cancel()
+                offerTimeoutJob = scope.launch {
+                    delay(com.example.lanvault.protocol.Constants.OFFER_RESPONSE_TIMEOUT_S * 1000L)
+                    if (pendingOffer != null) {
+                        respondToIncomingOffer(false)
+                        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                        nm.cancel(NOTIFICATION_ID_REQUEST)
+                    }
+                }
             }
             onProgress = { p ->
                 activeProgress = p
@@ -85,8 +97,22 @@ class TransferForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val notif = buildServiceNotification("LANVault service ready")
-        startForeground(NOTIFICATION_ID_SERVICE, notif)
+        when (intent?.action) {
+            ACTION_ACCEPT_OFFER -> {
+                respondToIncomingOffer(true)
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                nm.cancel(NOTIFICATION_ID_REQUEST)
+            }
+            ACTION_DECLINE_OFFER -> {
+                respondToIncomingOffer(false)
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                nm.cancel(NOTIFICATION_ID_REQUEST)
+            }
+            else -> {
+                val notif = buildServiceNotification("LANVault service ready")
+                startForeground(NOTIFICATION_ID_SERVICE, notif)
+            }
+        }
         return START_STICKY
     }
 
@@ -94,6 +120,7 @@ class TransferForegroundService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        offerTimeoutJob?.cancel()
         discovery.stop()
         transferEngine.stopServer()
         scope.cancel()
@@ -108,6 +135,8 @@ class TransferForegroundService : Service() {
     }
 
     fun respondToIncomingOffer(accept: Boolean) {
+        offerTimeoutJob?.cancel()
+        offerTimeoutJob = null
         pendingOffer?.let {
             it.callback(accept)
             if (accept) {
@@ -131,30 +160,49 @@ class TransferForegroundService : Service() {
         pendingOffer = null
     }
 
-    fun sendFiles(targetIp: String, targetPort: Int, files: List<File>, onComplete: (String?) -> Unit) {
+    fun sendSources(
+        targetIp: String,
+        targetPort: Int,
+        sources: List<com.example.lanvault.transfer.SendSource>,
+        peerFingerprint: String? = null,
+        onComplete: (String?) -> Unit
+    ) {
         scope.launch {
             try {
-                val tid = transferEngine.startSend(targetIp, targetPort, files)
+                val tid = transferEngine.startSendSources(targetIp, targetPort, sources, peerFingerprint)
                 db.recordTransfer(
                     TransferRecord(
                         transferId = tid,
                         direction = "send",
-                        peerFp = "",
+                        peerFp = peerFingerprint ?: "",
                         peerName = targetIp,
                         state = "completed",
-                        totalFiles = files.size,
-                        totalBytes = files.sumOf { it.length() },
-                        completedFiles = files.size,
-                        completedBytes = files.sumOf { it.length() },
+                        totalFiles = sources.size,
+                        totalBytes = sources.sumOf { it.size },
+                        completedFiles = sources.size,
+                        completedBytes = sources.sumOf { it.size },
                         manifestHash = "",
                         createdAt = System.currentTimeMillis()
                     )
                 )
                 onComplete(tid)
-            } catch (e: Exception) {
+            } catch (_: Exception) {
                 onComplete(null)
             }
         }
+    }
+
+    fun sendFiles(targetIp: String, targetPort: Int, files: List<File>, onComplete: (String?) -> Unit) {
+        val sources = files.map { file ->
+            com.example.lanvault.transfer.SendSource(
+                name = file.name,
+                size = file.length(),
+                mtime = file.lastModified(),
+                isDirectory = file.isDirectory,
+                file = file
+            )
+        }
+        sendSources(targetIp, targetPort, sources, onComplete = onComplete)
     }
 
     private fun createNotificationChannels() {
@@ -213,12 +261,24 @@ class TransferForegroundService : Service() {
         val mb = totalBytes / 1_000_000.0
         val text = "$senderName wants to send $fileCount files (${String.format("%.1f", mb)} MB)"
 
+        val acceptIntent = Intent(this, TransferForegroundService::class.java).apply {
+            action = ACTION_ACCEPT_OFFER
+        }
+        val acceptPending = PendingIntent.getService(this, 1, acceptIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+
+        val declineIntent = Intent(this, TransferForegroundService::class.java).apply {
+            action = ACTION_DECLINE_OFFER
+        }
+        val declinePending = PendingIntent.getService(this, 2, declineIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+
         val notif = NotificationCompat.Builder(this, CHANNEL_REQUEST)
             .setContentTitle("Incoming LANVault Transfer")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
+            .addAction(android.R.drawable.ic_input_add, "Accept", acceptPending)
+            .addAction(android.R.drawable.ic_delete, "Decline", declinePending)
             .build()
 
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -246,5 +306,8 @@ class TransferForegroundService : Service() {
         const val NOTIFICATION_ID_PROGRESS = 1002
         const val NOTIFICATION_ID_REQUEST = 1003
         const val NOTIFICATION_ID_COMPLETED = 1004
+
+        const val ACTION_ACCEPT_OFFER = "com.example.lanvault.ACTION_ACCEPT_OFFER"
+        const val ACTION_DECLINE_OFFER = "com.example.lanvault.ACTION_DECLINE_OFFER"
     }
 }

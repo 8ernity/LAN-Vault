@@ -83,6 +83,7 @@ func NewApp() *App {
 // startup is called when the app starts
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	transfer.SetPairingManager(a.pairingMgr)
 
 	configDir, _ := os.UserConfigDir()
 	a.dataDir = filepath.Join(configDir, "LANVault")
@@ -166,6 +167,11 @@ func (a *App) acceptLoop() {
 		go func(c net.Conn) {
 			defer c.Close()
 			onDecision := func(offer protocol.OfferMessage, peerName, peerFP string) (bool, string) {
+				ch := make(chan bool, 1)
+				a.mu.Lock()
+				a.pendingDecisions[offer.TransferID] = ch
+				a.mu.Unlock()
+
 				req := IncomingRequest{
 					TransferID: offer.TransferID,
 					SenderName: peerName,
@@ -175,11 +181,6 @@ func (a *App) acceptLoop() {
 					ShortFP:    identity.ShortFingerprintGrouped(peerFP),
 				}
 				runtime.EventsEmit(a.ctx, "transfer:incoming", req)
-
-				ch := make(chan bool, 1)
-				a.mu.Lock()
-				a.pendingDecisions[offer.TransferID] = ch
-				a.mu.Unlock()
 
 				select {
 				case accept := <-ch:
@@ -321,6 +322,22 @@ func (a *App) StartSend(targetAddr string, paths []string) error {
 	}
 
 	transferID := fmt.Sprintf("tr-%d", time.Now().UnixNano())
+	if a.st != nil {
+		a.st.SaveTransfer(store.TransferRecord{
+			TransferID:      transferID,
+			Direction:       "send",
+			PeerFingerprint: "",
+			PeerName:        targetAddr,
+			State:           "Transferring",
+			ChunkSize:       protocol.ChunkSizeDefault,
+			TotalFiles:      totalFiles,
+			TotalBytes:      totalBytes,
+			ManifestHash:    manifestHash,
+			CreatedAt:       time.Now().UnixMilli(),
+			UpdatedAt:       time.Now().UnixMilli(),
+		})
+	}
+
 	go func() {
 		progressCb := func(bytesAcked int64, total int64, filesDone int, totalFiles int) {
 			runtime.EventsEmit(a.ctx, "transfer:progress", map[string]any{
@@ -344,13 +361,121 @@ func (a *App) StartSend(targetAddr string, paths []string) error {
 			progressCb,
 		)
 		if err != nil {
+			if a.st != nil {
+				a.st.SaveTransfer(store.TransferRecord{
+					TransferID: transferID,
+					State:      "Failed",
+					UpdatedAt:  time.Now().UnixMilli(),
+				})
+			}
 			runtime.EventsEmit(a.ctx, "transfer:error", err.Error())
 		} else {
+			if a.st != nil {
+				a.st.SaveTransfer(store.TransferRecord{
+					TransferID:     transferID,
+					State:          "Completed",
+					CompletedFiles: doneOk.FilesCompleted,
+					CompletedBytes: doneOk.Bytes,
+					UpdatedAt:      time.Now().UnixMilli(),
+				})
+			}
 			runtime.EventsEmit(a.ctx, "transfer:completed", doneOk)
 		}
 	}()
 
 	return nil
+}
+
+// PairWithURI initiates a pairing handshake with a remote device specified by QR URI
+func (a *App) PairWithURI(rawURI string) error {
+	params, err := pairing.ParseURI(rawURI)
+	if err != nil {
+		return fmt.Errorf("invalid pairing URI: %w", err)
+	}
+
+	var conn net.Conn
+	var dialErr error
+	for _, ip := range params.IPs {
+		addr := net.JoinHostPort(ip, fmt.Sprintf("%d", params.Port))
+		clientTLS := a.id.ClientTLSConfigPinned(params.Fingerprint)
+		rawConn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			dialErr = err
+			continue
+		}
+		tlsConn := tls.Client(rawConn, clientTLS)
+		if err := tlsConn.Handshake(); err != nil {
+			rawConn.Close()
+			dialErr = err
+			continue
+		}
+		conn = tlsConn
+		break
+	}
+	if conn == nil {
+		return fmt.Errorf("failed to connect to pairing target: %w", dialErr)
+	}
+	defer conn.Close()
+
+	// 1. Send HELLO
+	hello := protocol.HelloMessage{
+		Version:      protocol.Version{Major: protocol.ProtocolMajor, Minor: protocol.ProtocolMinor},
+		DeviceID:     a.id.DeviceID,
+		Name:         a.deviceName,
+		Platform:     "windows",
+		Role:         "control",
+		Capabilities: []string{"resume", "multi-stream"},
+	}
+	if err := protocol.WriteJSONFrame(conn, protocol.FrameHello, hello); err != nil {
+		return fmt.Errorf("write HELLO failed: %w", err)
+	}
+
+	// 2. Read HELLO_OK
+	hOkFrame, err := protocol.ReadFrame(conn)
+	if err != nil {
+		return fmt.Errorf("read HELLO_OK failed: %w", err)
+	}
+	if hOkFrame.Type != protocol.FrameHelloOk {
+		return fmt.Errorf("expected HELLO_OK, got %s", hOkFrame.Type)
+	}
+
+	// 3. Send PAIR_REQUEST
+	pairReq := protocol.PairRequestMessage{
+		Token:    params.RawToken,
+		Name:     a.deviceName,
+		Platform: "windows",
+	}
+	if err := protocol.WriteJSONFrame(conn, protocol.FramePairRequest, pairReq); err != nil {
+		return fmt.Errorf("write PAIR_REQUEST failed: %w", err)
+	}
+
+	// 4. Read PAIR_OK or ERROR
+	respFrame, err := protocol.ReadFrame(conn)
+	if err != nil {
+		return fmt.Errorf("read PAIR_OK failed: %w", err)
+	}
+	if respFrame.Type == protocol.FramePairOk {
+		pairOk, err := protocol.DecodeJSONPayload[protocol.PairOkMessage](respFrame.Payload)
+		if err != nil {
+			return err
+		}
+		if a.st != nil {
+			_ = a.st.SaveTrustedDevice(store.TrustedDevice{
+				Fingerprint: params.Fingerprint,
+				DeviceID:    pairOk.DeviceID,
+				Name:        pairOk.Name,
+				Platform:    "remote",
+				PairedAt:    time.Now().UnixMilli(),
+				LastSeen:    time.Now().UnixMilli(),
+			})
+		}
+		return nil
+	} else if respFrame.Type == protocol.FrameError {
+		errMsg, _ := protocol.DecodeJSONPayload[protocol.ErrorMessage](respFrame.Payload)
+		return fmt.Errorf("pairing rejected: %s", errMsg.Message)
+	}
+
+	return fmt.Errorf("unexpected frame response: %s", respFrame.Type)
 }
 
 // RespondIncomingTransfer answers pending offer

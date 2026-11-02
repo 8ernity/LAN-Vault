@@ -53,7 +53,11 @@ enum class NavTab {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MainScreen(service: TransferForegroundService?) {
+fun MainScreen(
+    service: TransferForegroundService?,
+    initialSharedUris: List<Uri> = emptyList(),
+    onClearSharedUris: (() -> Unit)? = null
+) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     var currentTab by remember { mutableStateOf(NavTab.HOME) }
@@ -68,6 +72,16 @@ fun MainScreen(service: TransferForegroundService?) {
     var visibility by remember { mutableStateOf(db.getSetting("visibility", "contacts_only")) }
     var savePathDisplay by remember {
         mutableStateOf(db.getSetting("save_path_display", "Downloads/LANVault"))
+    }
+    var pendingSendSources by remember { mutableStateOf<List<com.example.lanvault.transfer.SendSource>>(emptyList()) }
+
+    LaunchedEffect(initialSharedUris) {
+        if (initialSharedUris.isNotEmpty()) {
+            val sources = initialSharedUris.map { uri -> getSendSourceFromUri(context, uri) }
+            pendingSendSources = pendingSendSources + sources
+            currentTab = NavTab.SEND
+            onClearSharedUris?.invoke()
+        }
     }
 
     val folderPickerLauncher = rememberLauncherForActivityResult(
@@ -113,49 +127,23 @@ fun MainScreen(service: TransferForegroundService?) {
         QRScannerView(
             onQrScanned = { qrText ->
                 showScanner = false
-                try {
-                    val uri = Uri.parse(qrText)
-                    val fp = uri.getQueryParameter("fp") ?: ""
-                    val name = uri.getQueryParameter("name") ?: "Windows PC"
-                    val devId = uri.getQueryParameter("id") ?: if (fp.length >= 16) fp.take(16) else "windows-pc"
-                    val ipParam = uri.getQueryParameter("ip") ?: ""
-                    val port = uri.getQueryParameter("port")?.toIntOrNull() ?: Protocol.DEFAULT_PORT
-                    val ips = ipParam.split(",").map { it.trim() }.filter { it.isNotEmpty() }
-                    val primaryIp = ips.firstOrNull() ?: ""
-
-                    if (fp.isNotBlank()) {
-                        val device = TrustedDevice(
-                            fingerprint = fp,
-                            deviceId = devId,
-                            name = name,
-                            platform = "windows",
-                            pairedAt = System.currentTimeMillis(),
-                            lastSeen = System.currentTimeMillis(),
-                            lastKnownIp = primaryIp
-                        )
-                        db.addTrustedDevice(device)
-                        trustedDevices = db.listTrustedDevices()
-
-                        if (ips.isNotEmpty()) {
-                            val manualPeer = DiscoveredPeer(
-                                deviceId = devId,
-                                name = name,
-                                platform = "windows",
-                                ips = ips,
-                                port = port,
-                                lastSeen = System.currentTimeMillis() + 86400000L
-                            )
-                            service?.discovery?.addManualPeer(manualPeer)
-                            selectedPeerForSend = manualPeer
+                coroutineScope.launch {
+                    Toast.makeText(context, "Pairing with peer...", Toast.LENGTH_SHORT).show()
+                    val engine = service?.transferEngine
+                    if (engine != null) {
+                        val result = engine.pairWithPeer(qrText)
+                        if (result.isSuccess) {
+                            val peerName = result.getOrNull() ?: "peer"
+                            trustedDevices = db.listTrustedDevices()
+                            Toast.makeText(context, "Successfully paired with $peerName!", Toast.LENGTH_SHORT).show()
+                            currentTab = NavTab.SEND
+                        } else {
+                            val msg = result.exceptionOrNull()?.message ?: "Unknown error"
+                            Toast.makeText(context, "Pairing failed: $msg", Toast.LENGTH_LONG).show()
                         }
-
-                        Toast.makeText(context, "Paired with $name! Ready to send.", Toast.LENGTH_SHORT).show()
-                        currentTab = NavTab.SEND
                     } else {
-                        Toast.makeText(context, "Invalid LANVault QR code", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "Transfer service not ready", Toast.LENGTH_SHORT).show()
                     }
-                } catch (e: Exception) {
-                    Toast.makeText(context, "Failed to parse QR: ${e.message}", Toast.LENGTH_SHORT).show()
                 }
             },
             onClose = { showScanner = false }
@@ -308,13 +296,18 @@ fun MainScreen(service: TransferForegroundService?) {
                     peers = peers,
                     trustedDevices = trustedDevices,
                     initialPeer = selectedPeerForSend,
+                    initialSources = pendingSendSources,
                     service = service,
-                    onTransferStarted = { currentTab = NavTab.TRANSFERS }
+                    onTransferStarted = {
+                        pendingSendSources = emptyList()
+                        currentTab = NavTab.TRANSFERS
+                    }
                 )
                 NavTab.RECEIVE -> ReceiveScreen(
                     identity = identity,
                     deviceName = deviceName,
                     savePathDisplay = savePathDisplay,
+                    service = service,
                     onChangeSaveLocation = { folderPickerLauncher.launch(null) },
                     onScanQR = { showScanner = true }
                 )
@@ -592,15 +585,15 @@ fun SendScreen(
     peers: List<DiscoveredPeer>,
     trustedDevices: List<TrustedDevice>,
     initialPeer: DiscoveredPeer?,
+    initialSources: List<com.example.lanvault.transfer.SendSource> = emptyList(),
     service: TransferForegroundService?,
     onTransferStarted: () -> Unit
 ) {
     val context = LocalContext.current
-    val coroutineScope = rememberCoroutineScope()
     var selectedPeer by remember(initialPeer, peers) {
         mutableStateOf(initialPeer ?: peers.firstOrNull())
     }
-    var selectedFiles by remember { mutableStateOf<List<File>>(emptyList()) }
+    var selectedSources by remember(initialSources) { mutableStateOf(initialSources) }
     var manualIp by remember { mutableStateOf("") }
     var isSending by remember { mutableStateOf(false) }
     var showManualInput by remember { mutableStateOf(false) }
@@ -608,22 +601,8 @@ fun SendScreen(
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris: List<Uri> ->
-        coroutineScope.launch(Dispatchers.IO) {
-            val copied = mutableListOf<File>()
-            for (uri in uris) {
-                val name = getFileName(context, uri) ?: "file_${System.currentTimeMillis()}"
-                val tempFile = File(context.cacheDir, name)
-                context.contentResolver.openInputStream(uri)?.use { input ->
-                    FileOutputStream(tempFile).use { output ->
-                        input.copyTo(output)
-                    }
-                }
-                copied.add(tempFile)
-            }
-            withContext(Dispatchers.Main) {
-                selectedFiles = selectedFiles + copied
-            }
-        }
+        val newSources = uris.map { uri -> getSendSourceFromUri(context, uri) }
+        selectedSources = selectedSources + newSources
     }
 
     LazyColumn(
@@ -774,22 +753,34 @@ fun SendScreen(
             }
         }
 
-        if (selectedFiles.isNotEmpty()) {
+        if (selectedSources.isNotEmpty()) {
             item {
-                val totalBytes = selectedFiles.sumOf { it.length() }
+                val totalBytes = selectedSources.sumOf { it.size }
                 val mb = totalBytes / 1_000_000.0
-                Text("${selectedFiles.size} files selected (${String.format("%.1f", mb)} MB)", fontWeight = FontWeight.Medium)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("${selectedSources.size} files selected (${String.format("%.1f", mb)} MB)", fontWeight = FontWeight.Medium)
+                    TextButton(onClick = { selectedSources = emptyList() }) {
+                        Text("Clear All", fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+                    }
+                }
             }
-            items(selectedFiles) { file ->
+            items(selectedSources) { source ->
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Row(
                         modifier = Modifier.padding(10.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(file.name, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                        val kb = file.length() / 1000.0
+                        Text(source.name, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                        val kb = source.size / 1000.0
                         Text("${String.format("%.1f", kb)} KB", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        IconButton(onClick = { selectedSources = selectedSources.filter { it != source } }) {
+                            Icon(Icons.Default.Close, contentDescription = "Remove", modifier = Modifier.size(16.dp))
+                        }
                     }
                 }
             }
@@ -797,12 +788,15 @@ fun SendScreen(
 
         item {
             val targetIp = selectedPeer?.ips?.firstOrNull { it.isNotBlank() } ?: manualIp.trim()
-            val canSend = targetIp.isNotBlank() && selectedFiles.isNotEmpty() && !isSending
+            val canSend = targetIp.isNotBlank() && selectedSources.isNotEmpty() && !isSending
 
             Button(
                 onClick = {
+                    val targetFp = selectedPeer?.let { p ->
+                        trustedDevices.find { it.deviceId == p.deviceId }?.fingerprint
+                    }
                     isSending = true
-                    service?.sendFiles(targetIp, 47800, selectedFiles) {
+                    service?.sendSources(targetIp, Protocol.DEFAULT_PORT, selectedSources, targetFp) {
                         isSending = false
                         onTransferStarted()
                     }
@@ -813,7 +807,7 @@ fun SendScreen(
                 Text(
                     when {
                         isSending -> "Sending..."
-                        selectedFiles.isEmpty() -> "Select Files to Send"
+                        selectedSources.isEmpty() -> "Select Files to Send"
                         targetIp.isBlank() -> "Select Recipient or Enter IP Above"
                         else -> "Send Files to ${selectedPeer?.name ?: targetIp}"
                     }
@@ -828,10 +822,19 @@ fun ReceiveScreen(
     identity: com.example.lanvault.crypto.DeviceIdentity,
     deviceName: String,
     savePathDisplay: String,
+    service: TransferForegroundService?,
     onChangeSaveLocation: () -> Unit,
     onScanQR: () -> Unit
 ) {
-    val qrContent = "lanvault://v1/pair?id=${identity.deviceId}&fp=${identity.fingerprint}&name=$deviceName"
+    val localIps = remember { getLocalIpAddresses() }
+    val qrContent = remember(identity, deviceName, localIps) {
+        service?.transferEngine?.generatePairingQR(localIps, deviceName)
+            ?: run {
+                val ipStr = localIps.joinToString(",")
+                val encodedName = java.net.URLEncoder.encode(deviceName, "UTF-8")
+                "lanvault://pair?v=1&fp=${identity.fingerprint}&ip=$ipStr&port=${Protocol.DEFAULT_PORT}&name=$encodedName&tok="
+            }
+    }
     val qrBitmap = remember(qrContent) { QRHelper.generateQRCode(qrContent, 512) }
 
     Column(
@@ -1065,4 +1068,47 @@ private fun getFolderDisplayName(context: Context, uri: Uri, docFile: DocumentFi
         }
     }
     return uri.lastPathSegment ?: "Custom Folder"
+}
+
+private fun getSendSourceFromUri(context: Context, uri: Uri): com.example.lanvault.transfer.SendSource {
+    var name = "file_${System.currentTimeMillis()}"
+    var size = 0L
+    try {
+        context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+            if (cursor.moveToFirst()) {
+                if (nameIdx != -1) cursor.getString(nameIdx)?.let { if (it.isNotBlank()) name = it }
+                if (sizeIdx != -1) size = cursor.getLong(sizeIdx)
+            }
+        }
+    } catch (_: Exception) {}
+    if (size <= 0L) {
+        try {
+            context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                size = pfd.statSize
+            }
+        } catch (_: Exception) {}
+    }
+    return com.example.lanvault.transfer.SendSource(uri = uri, file = null, name = name, size = size)
+}
+
+private fun getLocalIpAddresses(): List<String> {
+    val ips = mutableListOf<String>()
+    try {
+        val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
+        while (interfaces.hasMoreElements()) {
+            val iface = interfaces.nextElement()
+            if (iface.isLoopback || !iface.isUp) continue
+            for (addr in iface.inetAddresses) {
+                if (addr is java.net.Inet4Address && !addr.isLoopbackAddress) {
+                    val host = addr.hostAddress
+                    if (host != null && host.isNotEmpty()) {
+                        ips.add(host)
+                    }
+                }
+            }
+        }
+    } catch (_: Exception) {}
+    return ips
 }

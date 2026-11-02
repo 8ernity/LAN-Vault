@@ -26,15 +26,9 @@ object IdentityManager {
     fun getOrCreateIdentity(context: Context): DeviceIdentity {
         cachedIdentity?.let { return it }
 
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        var devId = prefs.getString(KEY_DEVICE_ID, null)
-        if (devId == null) {
-            devId = UUID.randomUUID().toString()
-            prefs.edit().putString(KEY_DEVICE_ID, devId).apply()
-        }
-
-        val (cert, key) = SelfSignedCertHelper.getOrGenerateKeyStoreIdentity(devId)
+        val (cert, key) = SelfSignedCertHelper.getOrGenerateKeyStoreIdentity("identity")
         val fp = computeFingerprint(cert)
+        val devId = fp.take(32)
         val ident = DeviceIdentity(devId, cert, key, fp, fp.take(8))
         cachedIdentity = ident
         return ident
@@ -50,7 +44,7 @@ object IdentityManager {
         return sb.toString()
     }
 
-    fun createSSLContext(identity: DeviceIdentity): SSLContext {
+    fun createSSLContext(identity: DeviceIdentity, expectedPeerFingerprint: String? = null): SSLContext {
         val keyManager = object : X509ExtendedKeyManager() {
             override fun getClientAliases(keyType: String?, issuers: Array<out Principal>?): Array<String> = arrayOf("lanvault")
             override fun chooseClientAlias(keyType: Array<out String>?, issuers: Array<out Principal>?, socket: Socket?): String = "lanvault"
@@ -65,12 +59,22 @@ object IdentityManager {
         val trustManager = object : X509TrustManager {
             override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {
                 if (chain.isNullOrEmpty()) throw CertificateException("Missing client certificate")
-                // Accept any valid certificate at TLS layer; verification happens in app layer against trust store
+                if (!expectedPeerFingerprint.isNullOrBlank()) {
+                    val actualFp = computeFingerprint(chain[0])
+                    if (!actualFp.equals(expectedPeerFingerprint, ignoreCase = true)) {
+                        throw CertificateException("Client certificate fingerprint $actualFp does not match pinned $expectedPeerFingerprint")
+                    }
+                }
             }
 
             override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {
                 if (chain.isNullOrEmpty()) throw CertificateException("Missing server certificate")
-                // Accept any valid certificate at TLS layer; verification happens in app layer against trust store
+                if (!expectedPeerFingerprint.isNullOrBlank()) {
+                    val actualFp = computeFingerprint(chain[0])
+                    if (!actualFp.equals(expectedPeerFingerprint, ignoreCase = true)) {
+                        throw CertificateException("Server certificate fingerprint $actualFp does not match pinned $expectedPeerFingerprint")
+                    }
+                }
             }
 
             override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()

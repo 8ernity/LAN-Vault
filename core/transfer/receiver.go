@@ -1,11 +1,13 @@
 package transfer
 
 import (
+	crand "crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -15,9 +17,22 @@ import (
 
 	"lanvault/core/fsutil"
 	"lanvault/core/identity"
+	"lanvault/core/pairing"
 	"lanvault/core/protocol"
 	"lanvault/core/store"
 )
+
+var (
+	globalPairingMgrMu sync.RWMutex
+	globalPairingMgr   *pairing.Manager
+)
+
+// SetPairingManager configures the active pairing manager for handling PAIR_REQUEST frames
+func SetPairingManager(pm *pairing.Manager) {
+	globalPairingMgrMu.Lock()
+	defer globalPairingMgrMu.Unlock()
+	globalPairingMgr = pm
+}
 
 // DecisionCallback is called when an OFFER arrives to decide whether to accept
 type DecisionCallback func(offer protocol.OfferMessage, peerName, peerFP string) (accept bool, targetDir string)
@@ -40,6 +55,7 @@ type ReceiverSession struct {
 
 	store           *store.Store
 	controlConn     net.Conn
+	ctrlMu          sync.Mutex
 	dataConns       []net.Conn
 	mu              sync.Mutex
 	partFiles       map[int]*os.File // open .lvpart file handles
@@ -129,7 +145,7 @@ func HandleIncomingControl(
 	// If this connection is a parallel DATA stream, route it directly to the active session
 	if hello.Role == "data" {
 		sess := getActiveSession(hello.TransferID)
-		if sess == nil || sess.StreamToken != hello.StreamToken {
+		if sess == nil || sess.StreamToken != hello.StreamToken || peerFP == "" || sess.SenderFP != peerFP {
 			protocol.WriteJSONFrame(tlsConn, protocol.FrameError, protocol.ErrorMessage{
 				Code:    int(protocol.ErrCodeProtocolError),
 				Message: "Invalid data connection credentials",
@@ -179,11 +195,56 @@ func HandleIncomingControl(
 		return fmt.Errorf("write HELLO_OK failed: %w", err)
 	}
 
-	// 2. Read OFFER
+	// 2. Read next control frame (OFFER or PAIR_REQUEST)
 	frame, err = protocol.ReadFrame(tlsConn)
 	if err != nil {
-		return fmt.Errorf("read OFFER failed: %w", err)
+		return fmt.Errorf("read frame failed: %w", err)
 	}
+
+	if frame.Type == protocol.FramePairRequest {
+		pairReq, err := protocol.DecodeJSONPayload[protocol.PairRequestMessage](frame.Payload)
+		if err != nil {
+			return err
+		}
+		globalPairingMgrMu.RLock()
+		pm := globalPairingMgr
+		globalPairingMgrMu.RUnlock()
+
+		if pm == nil {
+			protocol.WriteJSONFrame(tlsConn, protocol.FrameError, protocol.ErrorMessage{
+				Code:    int(protocol.ErrCodePairTokenInvalid),
+				Message: "Pairing is not currently active on this receiver",
+				Fatal:   true,
+			})
+			return errors.New("pairing not active")
+		}
+		if err := pm.VerifyToken(pairReq.Token); err != nil {
+			protocol.WriteJSONFrame(tlsConn, protocol.FrameError, protocol.ErrorMessage{
+				Code:    int(protocol.ErrCodePairTokenInvalid),
+				Message: fmt.Sprintf("Pairing token invalid or expired: %v", err),
+				Fatal:   true,
+			})
+			return fmt.Errorf("pairing token verification failed: %w", err)
+		}
+
+		if st != nil {
+			_ = st.SaveTrustedDevice(store.TrustedDevice{
+				Fingerprint: peerFP,
+				DeviceID:    hello.DeviceID,
+				Name:        pairReq.Name,
+				Platform:    pairReq.Platform,
+				PairedAt:    time.Now().UnixMilli(),
+				LastSeen:    time.Now().UnixMilli(),
+			})
+		}
+
+		pairOk := protocol.PairOkMessage{
+			DeviceID: serverID.DeviceID,
+			Name:     helloOk.Name,
+		}
+		return protocol.WriteJSONFrame(tlsConn, protocol.FramePairOk, pairOk)
+	}
+
 	if frame.Type != protocol.FrameOffer {
 		return fmt.Errorf("expected OFFER, got %s", frame.Type)
 	}
@@ -191,6 +252,32 @@ func HandleIncomingControl(
 	offer, err := protocol.DecodeJSONPayload[protocol.OfferMessage](frame.Payload)
 	if err != nil {
 		return err
+	}
+
+	// Validate OFFER fields per PRD/Protocol constraints
+	if offer.ChunkSize < protocol.ChunkSizeMin || offer.ChunkSize > protocol.ChunkSizeMax {
+		protocol.WriteJSONFrame(tlsConn, protocol.FrameError, protocol.ErrorMessage{
+			Code:    int(protocol.ErrCodeProtocolError),
+			Message: fmt.Sprintf("chunk_size %d out of bounds [%d, %d]", offer.ChunkSize, protocol.ChunkSizeMin, protocol.ChunkSizeMax),
+			Fatal:   true,
+		})
+		return fmt.Errorf("chunk_size %d out of bounds", offer.ChunkSize)
+	}
+	if offer.FileCount < 0 || offer.FileCount > protocol.MaxManifestEntries {
+		protocol.WriteJSONFrame(tlsConn, protocol.FrameError, protocol.ErrorMessage{
+			Code:    int(protocol.ErrCodePathInvalid),
+			Message: fmt.Sprintf("file_count %d out of bounds", offer.FileCount),
+			Fatal:   true,
+		})
+		return fmt.Errorf("file_count %d out of bounds", offer.FileCount)
+	}
+	if offer.TotalBytes < 0 {
+		protocol.WriteJSONFrame(tlsConn, protocol.FrameError, protocol.ErrorMessage{
+			Code:    int(protocol.ErrCodeProtocolError),
+			Message: "total_bytes cannot be negative",
+			Fatal:   true,
+		})
+		return errors.New("negative total_bytes")
 	}
 
 	// 3. Read MANIFEST_PART frames until MANIFEST_END
@@ -419,14 +506,22 @@ func HandleIncomingControl(
 		}
 
 		if ctrlFrame.Type == protocol.FrameDone {
-			// Sender says all chunks sent
+			// Sender says all chunks sent - verify completion before DONE_OK
+			if !sess.isAllComplete() {
+				sess.writeControlJSON(protocol.FrameError, protocol.ErrorMessage{
+					Code:    int(protocol.ErrCodeStateIntegrity),
+					Message: "Received DONE before all chunks and files were complete",
+					Fatal:   true,
+				})
+				return errors.New("cannot complete: missing chunks or incomplete files")
+			}
 			sess.flushAndFinalizeAll()
 			doneOk := protocol.DoneOkMessage{
 				TransferID:     sess.TransferID,
 				FilesCompleted: sess.FilesCompleted,
 				Bytes:          sess.BytesReceived,
 			}
-			protocol.WriteJSONFrame(tlsConn, protocol.FrameDoneOk, doneOk)
+			sess.writeControlJSON(protocol.FrameDoneOk, doneOk)
 			st.SaveTransfer(store.TransferRecord{
 				TransferID:     sess.TransferID,
 				State:          "Completed",
@@ -446,20 +541,63 @@ func HandleIncomingControl(
 	}
 }
 
+func (s *ReceiverSession) writeControlRaw(frameType protocol.FrameType, payload []byte) error {
+	s.ctrlMu.Lock()
+	defer s.ctrlMu.Unlock()
+	return protocol.WriteRawFrame(s.controlConn, frameType, payload)
+}
+
+func (s *ReceiverSession) writeControlJSON(frameType protocol.FrameType, v any) error {
+	s.ctrlMu.Lock()
+	defer s.ctrlMu.Unlock()
+	return protocol.WriteJSONFrame(s.controlConn, frameType, v)
+}
+
+func (s *ReceiverSession) isAllComplete() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for idx, entry := range s.Entries {
+		if entry.Type != "file" || entry.Size == 0 {
+			continue
+		}
+		bmp := s.Bitmaps[idx]
+		if bmp == nil || !bmp.IsComplete() {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *ReceiverSession) handleDataFrame(payload []byte) error {
 	df, err := protocol.DecodeDataFramePayload(payload)
 	if err != nil {
 		return err
 	}
 
+	if int(df.FileIndex) >= len(s.Entries) || s.Entries[df.FileIndex].Type != "file" {
+		return fmt.Errorf("invalid file index %d in data frame", df.FileIndex)
+	}
+
+	fileSize := s.Entries[df.FileIndex].Size
+	expectedOffset := int64(df.ChunkIndex) * s.ChunkSize
+	if expectedOffset >= fileSize && fileSize > 0 {
+		return fmt.Errorf("chunk offset %d exceeds file size %d", expectedOffset, fileSize)
+	}
+	expectedLen := s.ChunkSize
+	if expectedOffset+expectedLen > fileSize {
+		expectedLen = fileSize - expectedOffset
+	}
+	if int64(len(df.Data)) != expectedLen {
+		return fmt.Errorf("chunk data length %d mismatch expected %d", len(df.Data), expectedLen)
+	}
+
 	// Verify SHA-256 hash of chunk
 	computedHash := sha256.Sum256(df.Data)
 	if computedHash != df.Hash {
 		// Mismatch: queue CHUNK_NEED
-		s.mu.Lock()
 		need := protocol.IndexPair{FileIndex: df.FileIndex, ChunkIndex: df.ChunkIndex}
-		protocol.WriteRawFrame(s.controlConn, protocol.FrameChunkNeed, protocol.EncodeIndexPairs([]protocol.IndexPair{need}))
-		s.mu.Unlock()
+		_ = s.writeControlRaw(protocol.FrameChunkNeed, protocol.EncodeIndexPairs([]protocol.IndexPair{need}))
 		return fmt.Errorf("chunk hash mismatch for file %d chunk %d", df.FileIndex, df.ChunkIndex)
 	}
 
@@ -486,7 +624,7 @@ func (s *ReceiverSession) handleDataFrame(payload []byte) error {
 
 	// Queue ACK
 	ackPair := protocol.IndexPair{FileIndex: df.FileIndex, ChunkIndex: df.ChunkIndex}
-	protocol.WriteRawFrame(s.controlConn, protocol.FrameChunkAck, protocol.EncodeIndexPairs([]protocol.IndexPair{ackPair}))
+	_ = s.writeControlRaw(protocol.FrameChunkAck, protocol.EncodeIndexPairs([]protocol.IndexPair{ackPair}))
 
 	// If file completed, finalize it
 	if bmp != nil && bmp.IsComplete() {
@@ -508,20 +646,22 @@ func (s *ReceiverSession) finalizeFile(fileIndex int) error {
 	fullDestPath := filepath.Join(s.TargetDir, filepath.FromSlash(finalRelPath))
 	partPath := fullDestPath + ".lvpart"
 
+	finalPath := fsutil.AvailableDiskFilename(fullDestPath)
+
 	// Atomic rename to final path
-	if err := os.Rename(partPath, fullDestPath); err != nil {
+	if err := os.Rename(partPath, finalPath); err != nil {
 		return fmt.Errorf("rename to final path failed: %w", err)
 	}
 
 	// Set mtime
 	entry := s.Entries[fileIndex]
 	mtime := time.UnixMilli(entry.MtimeMs)
-	os.Chtimes(fullDestPath, mtime, mtime)
+	os.Chtimes(finalPath, mtime, mtime)
 
 	s.FilesCompleted++
 
 	// Send FILE_DONE
-	protocol.WriteJSONFrame(s.controlConn, protocol.FrameFileDone, protocol.FileDoneMessage{Index: fileIndex})
+	_ = s.writeControlJSON(protocol.FrameFileDone, protocol.FileDoneMessage{Index: fileIndex})
 
 	// Update store
 	bmp := s.Bitmaps[fileIndex]
@@ -536,7 +676,10 @@ func (s *ReceiverSession) flushAndFinalizeAll() {
 	defer s.mu.Unlock()
 
 	for idx := range s.partFiles {
-		s.finalizeFile(idx)
+		bmp := s.Bitmaps[idx]
+		if bmp != nil && bmp.IsComplete() {
+			s.finalizeFile(idx)
+		}
 	}
 }
 
@@ -551,7 +694,7 @@ func (s *ReceiverSession) cleanup() {
 }
 
 func cryptoRandRead(b []byte) {
-	for i := range b {
-		b[i] = byte(time.Now().UnixNano() + int64(i))
+	if _, err := io.ReadFull(crand.Reader, b); err != nil {
+		panic(fmt.Sprintf("crypto/rand.Read failed: %v", err))
 	}
 }

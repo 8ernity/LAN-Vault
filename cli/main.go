@@ -80,6 +80,7 @@ func main() {
 		listenFlags := flag.NewFlagSet("listen", flag.ExitOnError)
 		port := listenFlags.Int("port", protocol.DefaultPort, "TCP listen port")
 		destDir := listenFlags.String("dir", filepath.Join(dataDir, "Received"), "Directory to save received files")
+		autoAccept := listenFlags.Bool("auto-accept-for-testing", false, "Automatically accept incoming transfers (test only)")
 		listenFlags.Parse(os.Args[2:])
 
 		os.MkdirAll(*destDir, 0755)
@@ -98,8 +99,18 @@ func main() {
 		onDecision := func(offer protocol.OfferMessage, peerName, peerFP string) (bool, string) {
 			fmt.Printf("\n[OFFER] Incoming transfer from '%s' (%s)\n", peerName, identity.ShortFingerprintGrouped(peerFP))
 			fmt.Printf("        Files: %d, Total bytes: %d, Chunk size: %d bytes\n", offer.FileCount, offer.TotalBytes, offer.ChunkSize)
-			fmt.Printf("        Accepting automatically into: %s\n", *destDir)
-			return true, *destDir
+			if *autoAccept {
+				fmt.Printf("        [auto-accept-for-testing] Accepting into: %s\n", *destDir)
+				return true, *destDir
+			}
+			fmt.Printf("        Accept transfer into '%s'? [y/N]: ", *destDir)
+			var response string
+			fmt.Scanln(&response)
+			if strings.EqualFold(strings.TrimSpace(response), "y") || strings.EqualFold(strings.TrimSpace(response), "yes") {
+				return true, *destDir
+			}
+			fmt.Println("        Declined transfer.")
+			return false, ""
 		}
 
 		for {

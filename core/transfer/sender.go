@@ -30,9 +30,16 @@ func StartSend(
 	manifestHash string,
 	chunkSize int64,
 	progressCb ProgressCallback,
+	expectedPeerFP ...string,
 ) (*protocol.DoneOkMessage, error) {
 	// 1. Connect control connection
-	clientTLS := senderID.ClientTLSConfig()
+	var clientTLS *tls.Config
+	if len(expectedPeerFP) > 0 && expectedPeerFP[0] != "" {
+		clientTLS = senderID.ClientTLSConfigPinned(expectedPeerFP[0])
+	} else {
+		clientTLS = senderID.ClientTLSConfig()
+	}
+
 	rawControl, err := net.DialTimeout("tcp", receiverAddr, 10*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial receiver %s: %w", receiverAddr, err)
@@ -43,6 +50,12 @@ func StartSend(
 	if err := controlConn.Handshake(); err != nil {
 		return nil, fmt.Errorf("control TLS handshake failed: %w", err)
 	}
+
+	peerFP := ""
+	if peerCerts := controlConn.ConnectionState().PeerCertificates; len(peerCerts) > 0 {
+		peerFP = identity.FingerprintFromDER(peerCerts[0].Raw)
+	}
+	dataTLS := senderID.ClientTLSConfigPinned(peerFP)
 
 	// 2. Send HELLO
 	hello := protocol.HelloMessage{
@@ -157,7 +170,7 @@ func StartSend(
 		if err != nil {
 			return nil, fmt.Errorf("failed to dial data stream %d: %w", i, err)
 		}
-		tlsD := tls.Client(rawD, clientTLS)
+		tlsD := tls.Client(rawD, dataTLS)
 		if err := tlsD.Handshake(); err != nil {
 			return nil, fmt.Errorf("data stream %d handshake failed: %w", i, err)
 		}
@@ -183,10 +196,16 @@ func StartSend(
 		}
 	}()
 
-	// 7. Stream DATA frames and receive CHUNK_ACKs
+	// 7. Stream DATA frames and receive CHUNK_ACKs with windowing and completion barrier
+	itemsMap := make(map[int]ScannedItem)
+	for _, it := range items {
+		itemsMap[it.Entry.Index] = it
+	}
+
 	var totalAckedBytes int64 = 0
 	var totalFilesDone int32 = 0
 	ackChan := make(chan protocol.IndexPair, 1000)
+	needChan := make(chan protocol.IndexPair, 100)
 	errChan := make(chan error, 2)
 	doneOkChan := make(chan *protocol.DoneOkMessage, 1)
 
@@ -208,6 +227,13 @@ func StartSend(
 						ackChan <- p
 					}
 				}
+			case protocol.FrameChunkNeed:
+				pairs, err := protocol.DecodeIndexPairs(cf.Payload)
+				if err == nil {
+					for _, p := range pairs {
+						needChan <- p
+					}
+				}
 			case protocol.FrameFileDone:
 				atomic.AddInt32(&totalFilesDone, 1)
 			case protocol.FrameDoneOk:
@@ -223,7 +249,59 @@ func StartSend(
 		}
 	}()
 
-	// Track window per stream
+	// In-flight windowing: max chunks in-flight across all streams
+	maxInFlight := dataStreams * protocol.WindowChunksPerStream
+	if maxInFlight < 1 {
+		maxInFlight = 1
+	}
+	inFlight := make(map[string]bool)
+
+	processAck := func(p protocol.IndexPair) {
+		k := fmt.Sprintf("%d:%d", p.FileIndex, p.ChunkIndex)
+		if inFlight[k] {
+			delete(inFlight, k)
+			it, ok := itemsMap[int(p.FileIndex)]
+			if ok {
+				offset := int64(p.ChunkIndex) * chunkSize
+				cLen := chunkSize
+				if offset+cLen > it.Entry.Size {
+					cLen = it.Entry.Size - offset
+				}
+				atomic.AddInt64(&totalAckedBytes, cLen)
+				if progressCb != nil {
+					progressCb(atomic.LoadInt64(&totalAckedBytes), totalBytes, int(atomic.LoadInt32(&totalFilesDone)), totalFiles)
+				}
+			}
+		}
+	}
+
+	drainAcksNonBlocking := func() error {
+		for {
+			select {
+			case p := <-ackChan:
+				processAck(p)
+			case err := <-errChan:
+				return err
+			default:
+				return nil
+			}
+		}
+	}
+
+	waitForAckSlot := func() error {
+		for len(inFlight) >= maxInFlight {
+			select {
+			case p := <-ackChan:
+				processAck(p)
+			case err := <-errChan:
+				return err
+			case <-time.After(30 * time.Second):
+				return errors.New("timeout waiting for chunk ACK")
+			}
+		}
+		return nil
+	}
+
 	streamIdx := 0
 	var streamMu sync.Mutex
 
@@ -244,6 +322,12 @@ func StartSend(
 			// Skip if receiver already has chunk
 			if bmp != nil && bmp.IsSet(chunkIdx) {
 				continue
+			}
+
+			// Wait if window is full
+			if err := waitForAckSlot(); err != nil {
+				f.Close()
+				return nil, err
 			}
 
 			offset := int64(chunkIdx) * chunkSize
@@ -271,24 +355,28 @@ func StartSend(
 				return nil, fmt.Errorf("failed to write data frame: %w", err)
 			}
 
-			// Read ACKs if available to track progress
-			for {
-				select {
-				case <-ackChan:
-					atomic.AddInt64(&totalAckedBytes, currChunkLen)
-					if progressCb != nil {
-						progressCb(totalAckedBytes, totalBytes, int(totalFilesDone), totalFiles)
-					}
-				case err := <-errChan:
-					f.Close()
-					return nil, err
-				default:
-					goto NextChunk
-				}
+			inFlightKey := fmt.Sprintf("%d:%d", item.Entry.Index, chunkIdx)
+			inFlight[inFlightKey] = true
+
+			// Drain available ACKs
+			if err := drainAcksNonBlocking(); err != nil {
+				f.Close()
+				return nil, err
 			}
-		NextChunk:
 		}
 		f.Close()
+	}
+
+	// Completion Barrier: Wait for all in-flight chunks to be acknowledged before sending DONE
+	for len(inFlight) > 0 {
+		select {
+		case p := <-ackChan:
+			processAck(p)
+		case err := <-errChan:
+			return nil, err
+		case <-time.After(30 * time.Second):
+			return nil, errors.New("timeout waiting for remaining in-flight chunk ACKs")
+		}
 	}
 
 	// 8. Send DONE frame on control connection

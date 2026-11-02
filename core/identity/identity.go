@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -125,22 +126,44 @@ func (id *Identity) ServerTLSConfig() *tls.Config {
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{id.TLSCertificate()},
 		ClientAuth:   tls.RequireAnyClientCert,
-		// No CA validation on the wire - trust verified at application layer by fingerprint
 		InsecureSkipVerify: true,
+		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return errors.New("tls: client presented no certificate")
+			}
+			return nil
+		},
 	}
 }
 
-// ClientTLSConfig creates mutual TLS 1.3 client config
-func (id *Identity) ClientTLSConfig() *tls.Config {
+// ClientTLSConfigPinned creates mutual TLS 1.3 client config pinned to expected peer fingerprint (if non-empty)
+func (id *Identity) ClientTLSConfigPinned(expectedFP string) *tls.Config {
 	cert := id.TLSCertificate()
 	return &tls.Config{
 		MinVersion:         tls.VersionTLS13,
 		Certificates:       []tls.Certificate{cert},
 		InsecureSkipVerify: true,
+		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return errors.New("tls: peer presented no certificate")
+			}
+			if expectedFP != "" {
+				peerFP := FingerprintFromDER(rawCerts[0])
+				if !strings.EqualFold(peerFP, expectedFP) {
+					return fmt.Errorf("tls: peer certificate fingerprint %s does not match expected %s", peerFP, expectedFP)
+				}
+			}
+			return nil
+		},
 		GetClientCertificate: func(cri *tls.CertificateRequestInfo) (*tls.Certificate, error) {
 			return &cert, nil
 		},
 	}
+}
+
+// ClientTLSConfig creates mutual TLS 1.3 client config
+func (id *Identity) ClientTLSConfig() *tls.Config {
+	return id.ClientTLSConfigPinned("")
 }
 
 // SavePEM writes identity key and certificate in PEM format to a directory
@@ -202,6 +225,12 @@ func LoadPEM(dir string) (*Identity, error) {
 	privKey, err := x509.ParseECPrivateKey(keyBlock.Bytes)
 	if err != nil {
 		return nil, err
+	}
+
+	// Validate that loaded certificate matches private key (F42)
+	pubKey, ok := cert.PublicKey.(*ecdsa.PublicKey)
+	if !ok || !pubKey.Equal(&privKey.PublicKey) {
+		return nil, errors.New("loaded certificate public key does not match private key")
 	}
 
 	fp := FingerprintFromDER(certBlock.Bytes)

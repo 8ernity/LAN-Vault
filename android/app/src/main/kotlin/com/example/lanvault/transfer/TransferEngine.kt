@@ -172,16 +172,18 @@ class TransferEngine(
             }
         }
 
-        fun cleanupTransfer() {
+        fun cleanupTransfer(deletePartials: Boolean = false) {
             if (isCompleted) return
             for ((_, writer) in writers) {
                 try { writer.syncAndClose() } catch (_: Exception) {}
             }
-            for ((_, partDoc) in safPartDocs) {
-                try { partDoc.delete() } catch (_: Exception) {}
-            }
-            for ((_, part) in partFiles) {
-                try { if (part.exists()) part.delete() } catch (_: Exception) {}
+            if (deletePartials) {
+                for ((_, partDoc) in safPartDocs) {
+                    try { partDoc.delete() } catch (_: Exception) {}
+                }
+                for ((_, part) in partFiles) {
+                    try { if (part.exists()) part.delete() } catch (_: Exception) {}
+                }
             }
         }
 
@@ -836,6 +838,7 @@ class TransferEngine(
         return startSendSources(targetIp, targetPort, sources, peerFingerprint)
     }
 
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     suspend fun startSendSources(
         targetIp: String,
         targetPort: Int,
@@ -967,32 +970,61 @@ class TransferEngine(
                 throw IOException("Expected HELLO_OK on data connection, got ${dataHelloOk.type}")
             }
 
-            // 7. Stream DATA chunks with ACK tracking
+            // 7. Stream DATA chunks with ACK tracking and flow control
             val chunkSize = Protocol.CHUNK_SIZE_DEFAULT
             val buffer = ByteArray(chunkSize)
             val startTime = System.currentTimeMillis()
             var bytesAcked = 0L
             var filesCompletedCount = 0
 
-            for ((fileIdx, src) in sources.withIndex()) {
-                if (src.isDirectory || src.size == 0L) continue
-                val inputStream = if (src.file != null) {
-                    FileInputStream(src.file)
-                } else if (src.uri != null) {
-                    context.contentResolver.openInputStream(src.uri)
-                } else null
-                if (inputStream == null) continue
+            val maxInFlight = Protocol.WINDOW_CHUNKS_PER_STREAM
+            val inFlight = ConcurrentHashMap.newKeySet<String>()
+            val ackChannel = kotlinx.coroutines.channels.Channel<Pair<Int, Int>>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+            val doneOkDeferred = CompletableDeferred<JSONObject>()
+            val errorDeferred = CompletableDeferred<String>()
 
-                var chunkIdx = 0
+            val controlReaderJob = CoroutineScope(Dispatchers.IO).launch {
                 try {
-                    while (true) {
-                        val n = inputStream.read(buffer)
-                        if (n <= 0) break
-                        val chunkData = if (n == buffer.size) buffer else buffer.copyOf(n)
-                        val payload = Framing.encodeDataFramePayload(fileIdx, chunkIdx, chunkData)
-                        Framing.writeRawFrame(dataOut, Protocol.FRAME_DATA, payload)
-                        bytesAcked += n
-                        chunkIdx++
+                    while (isActive) {
+                        val frame = Framing.readFrame(input)
+                        when (frame.type) {
+                            Protocol.FRAME_CHUNK_ACK -> {
+                                val pairs = Framing.decodeIndexPairs(frame.payload)
+                                for (p in pairs) {
+                                    ackChannel.send(p)
+                                }
+                            }
+                            Protocol.FRAME_FILE_DONE -> {
+                                // File confirmed on receiver
+                            }
+                            Protocol.FRAME_DONE_OK -> {
+                                val json = JSONObject(String(frame.payload, StandardCharsets.UTF_8))
+                                doneOkDeferred.complete(json)
+                                return@launch
+                            }
+                            Protocol.FRAME_ERROR -> {
+                                val msg = String(frame.payload, StandardCharsets.UTF_8)
+                                errorDeferred.complete(msg)
+                                return@launch
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    if (isActive && !doneOkDeferred.isCompleted) {
+                        errorDeferred.complete(e.message ?: "Control socket closed")
+                    }
+                }
+            }
+
+            fun processAck(p: Pair<Int, Int>) {
+                val key = "${p.first}:${p.second}"
+                if (inFlight.remove(key)) {
+                    val fIdx = p.first
+                    if (fIdx in sources.indices) {
+                        val offset = p.second.toLong() * chunkSize
+                        val fSize = sources[fIdx].size
+                        val cLen = if (offset + chunkSize > fSize) fSize - offset else chunkSize.toLong()
+                        bytesAcked += cLen
 
                         val elapsed = (System.currentTimeMillis() - startTime) / 1000L
                         val speed = if (elapsed > 0) bytesAcked / elapsed else 0L
@@ -1009,26 +1041,93 @@ class TransferEngine(
                             )
                         )
                     }
-                    filesCompletedCount++
-                } finally {
-                    try { inputStream.close() } catch (_: Exception) {}
                 }
             }
 
-            // 8. Send DONE frame
-            val doneJson = JSONObject().apply {
-                put("transfer_id", transferId)
-            }.toString()
-            try { Framing.writeJSONFrame(dataOut, Protocol.FRAME_DONE, doneJson) } catch (_: Exception) {}
-            Framing.writeJSONFrame(output, Protocol.FRAME_DONE, doneJson)
-
-            // 9. Read DONE_OK
-            val doneOkFrame = Framing.readFrame(input)
-            if (doneOkFrame.type == Protocol.FRAME_DONE_OK) {
-                onCompleted?.invoke(transferId)
+            fun drainAcksNonBlocking() {
+                while (true) {
+                    val res = ackChannel.tryReceive()
+                    if (res.isSuccess) {
+                        val p = res.getOrNull()
+                        if (p != null) processAck(p)
+                    } else {
+                        break
+                    }
+                }
             }
 
-            try { dataSocket.close() } catch (_: Exception) {}
+            suspend fun waitForSlot() {
+                while (inFlight.size >= maxInFlight) {
+                    if (errorDeferred.isCompleted) {
+                        throw IOException("Receiver error: ${errorDeferred.getCompleted()}")
+                    }
+                    val p = withTimeoutOrNull(30_000L) {
+                        ackChannel.receive()
+                    } ?: throw IOException("Timeout waiting for chunk ACK")
+                    processAck(p)
+                }
+            }
+
+            try {
+                for ((fileIdx, src) in sources.withIndex()) {
+                    if (src.isDirectory || src.size == 0L) continue
+                    val inputStream = if (src.file != null) {
+                        FileInputStream(src.file)
+                    } else if (src.uri != null) {
+                        context.contentResolver.openInputStream(src.uri)
+                    } else null
+                    if (inputStream == null) continue
+
+                    var chunkIdx = 0
+                    try {
+                        while (true) {
+                            val n = inputStream.read(buffer)
+                            if (n <= 0) break
+
+                            waitForSlot()
+
+                            val chunkData = if (n == buffer.size) buffer else buffer.copyOf(n)
+                            val payload = Framing.encodeDataFramePayload(fileIdx, chunkIdx, chunkData)
+                            Framing.writeRawFrame(dataOut, Protocol.FRAME_DATA, payload)
+                            inFlight.add("${fileIdx}:${chunkIdx}")
+                            chunkIdx++
+
+                            drainAcksNonBlocking()
+                        }
+                        filesCompletedCount++
+                    } finally {
+                        try { inputStream.close() } catch (_: Exception) {}
+                    }
+                }
+
+                // Completion barrier: wait for all in-flight chunk ACKs before sending DONE
+                while (inFlight.isNotEmpty()) {
+                    if (errorDeferred.isCompleted) {
+                        throw IOException("Receiver error: ${errorDeferred.getCompleted()}")
+                    }
+                    val p = withTimeoutOrNull(30_000L) {
+                        ackChannel.receive()
+                    } ?: throw IOException("Timeout waiting for final chunk ACKs")
+                    processAck(p)
+                }
+
+                // 8. Send DONE frame on data socket and control socket
+                val doneJson = JSONObject().apply {
+                    put("transfer_id", transferId)
+                }.toString()
+                try { Framing.writeJSONFrame(dataOut, Protocol.FRAME_DONE, doneJson) } catch (_: Exception) {}
+                Framing.writeJSONFrame(output, Protocol.FRAME_DONE, doneJson)
+
+                // 9. Read DONE_OK via deferred
+                withTimeoutOrNull(30_000L) {
+                    doneOkDeferred.await()
+                } ?: throw IOException("Timeout waiting for DONE_OK")
+                onCompleted?.invoke(transferId)
+
+            } finally {
+                controlReaderJob.cancel()
+                try { dataSocket.close() } catch (_: Exception) {}
+            }
             return@withContext transferId
         } finally {
             try { socket.close() } catch (_: Exception) {}

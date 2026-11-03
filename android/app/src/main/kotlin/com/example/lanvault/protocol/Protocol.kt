@@ -52,6 +52,7 @@ object Protocol {
     const val PAIR_TOKEN_TTL_S = Constants.PAIR_TOKEN_TTL_S
     const val PAIR_MAX_FAILED_ATTEMPTS = Constants.PAIR_MAX_FAILED_ATTEMPTS
     const val OFFER_RESPONSE_TIMEOUT_S = Constants.OFFER_RESPONSE_TIMEOUT_S
+    const val WINDOW_CHUNKS_PER_STREAM = 8
 
     // Error codes from specification
     const val ERR_PROTOCOL_ERROR = Constants.ERR_PROTOCOL_ERROR

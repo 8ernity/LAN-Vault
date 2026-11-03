@@ -275,11 +275,58 @@ func StartSend(
 		}
 	}
 
+	streamIdx := 0
+	var streamMu sync.Mutex
+
+	retransmitChunk := func(p protocol.IndexPair) error {
+		it, ok := itemsMap[int(p.FileIndex)]
+		if !ok || it.Entry.Type != "file" || it.Entry.Size == 0 {
+			return nil
+		}
+		offset := int64(p.ChunkIndex) * chunkSize
+		currChunkLen := chunkSize
+		if offset+currChunkLen > it.Entry.Size {
+			currChunkLen = it.Entry.Size - offset
+		}
+		if currChunkLen <= 0 {
+			return nil
+		}
+		f, err := os.Open(it.SourceDiskPath)
+		if err != nil {
+			return fmt.Errorf("failed to open file for retransmit %s: %w", it.SourceDiskPath, err)
+		}
+		defer f.Close()
+
+		buf := make([]byte, currChunkLen)
+		if _, err := f.ReadAt(buf, offset); err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("failed to read chunk for retransmit: %w", err)
+		}
+
+		dataPayload := protocol.EncodeDataFrame(p.FileIndex, p.ChunkIndex, buf)
+
+		streamMu.Lock()
+		targetConn := dataConns[streamIdx%dataStreams]
+		streamIdx++
+		streamMu.Unlock()
+
+		if err := protocol.WriteRawFrame(targetConn, protocol.FrameData, dataPayload); err != nil {
+			return fmt.Errorf("failed to write retransmitted data frame: %w", err)
+		}
+
+		inFlightKey := fmt.Sprintf("%d:%d", p.FileIndex, p.ChunkIndex)
+		inFlight[inFlightKey] = true
+		return nil
+	}
+
 	drainAcksNonBlocking := func() error {
 		for {
 			select {
 			case p := <-ackChan:
 				processAck(p)
+			case n := <-needChan:
+				if err := retransmitChunk(n); err != nil {
+					return err
+				}
 			case err := <-errChan:
 				return err
 			default:
@@ -293,6 +340,10 @@ func StartSend(
 			select {
 			case p := <-ackChan:
 				processAck(p)
+			case n := <-needChan:
+				if err := retransmitChunk(n); err != nil {
+					return err
+				}
 			case err := <-errChan:
 				return err
 			case <-time.After(30 * time.Second):
@@ -301,9 +352,6 @@ func StartSend(
 		}
 		return nil
 	}
-
-	streamIdx := 0
-	var streamMu sync.Mutex
 
 	for _, item := range items {
 		if item.Entry.Type != "file" || item.Entry.Size == 0 {
@@ -372,6 +420,10 @@ func StartSend(
 		select {
 		case p := <-ackChan:
 			processAck(p)
+		case n := <-needChan:
+			if err := retransmitChunk(n); err != nil {
+				return nil, err
+			}
 		case err := <-errChan:
 			return nil, err
 		case <-time.After(30 * time.Second):

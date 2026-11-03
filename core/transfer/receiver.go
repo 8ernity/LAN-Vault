@@ -169,13 +169,23 @@ func HandleIncomingControl(
 					slog.Error("failed to handle data frame", "err", err)
 				}
 			} else if df.Type == protocol.FrameDone {
+				if !sess.isAllComplete() {
+					errPayload := protocol.ErrorMessage{
+						Code:    int(protocol.ErrCodeStateIntegrity),
+						Message: "Received DONE on data connection before all chunks and files were complete",
+						Fatal:   true,
+					}
+					_ = sess.writeControlJSON(protocol.FrameError, errPayload)
+					_ = protocol.WriteJSONFrame(tlsConn, protocol.FrameError, errPayload)
+					return errors.New("cannot complete: missing chunks or incomplete files on data connection")
+				}
 				sess.flushAndFinalizeAll()
 				doneOk := protocol.DoneOkMessage{
 					TransferID:     sess.TransferID,
 					FilesCompleted: sess.FilesCompleted,
 					Bytes:          sess.BytesReceived,
 				}
-				_ = protocol.WriteJSONFrame(sess.controlConn, protocol.FrameDoneOk, doneOk)
+				_ = sess.writeControlJSON(protocol.FrameDoneOk, doneOk)
 				_ = protocol.WriteJSONFrame(tlsConn, protocol.FrameDoneOk, doneOk)
 				st.SaveTransfer(store.TransferRecord{
 					TransferID:     sess.TransferID,
@@ -356,11 +366,13 @@ func HandleIncomingControl(
 	// Check if this transfer is a resume from store
 	haveBitmaps := make(map[string]string)
 	isResume := false
+	existingFilesMap := make(map[int]store.TransferFileRecord)
 	existingTransfer, err := st.GetTransfer(offer.TransferID)
 	if err == nil && existingTransfer != nil && existingTransfer.ManifestHash == calcHash && existingTransfer.PeerFingerprint == peerFP {
 		isResume = true
 		files, _ := st.GetTransferFiles(offer.TransferID)
 		for _, f := range files {
+			existingFilesMap[f.FileIndex] = f
 			if len(f.ChunkBitmap) > 0 {
 				bmp, err := protocol.FromBytes(f.ChunkCount, f.ChunkBitmap)
 				if err == nil && bmp.CompletedCount() > 0 {
@@ -400,6 +412,8 @@ func HandleIncomingControl(
 	var fileRecords []store.TransferFileRecord
 	bitmaps := make(map[int]*protocol.Bitmap)
 	partFiles := make(map[int]*os.File)
+	var initialCompletedFiles int
+	var initialBytesReceived int64
 
 	for i, e := range entries {
 		finalRelPath := plannedPaths[i]
@@ -414,19 +428,58 @@ func HandleIncomingControl(
 			if e.Size > 0 {
 				chunkCount = int((e.Size + offer.ChunkSize - 1) / offer.ChunkSize)
 			}
-			bmp := protocol.NewBitmap(chunkCount)
+			var bmp *protocol.Bitmap
+			if isResume {
+				if ef, ok := existingFilesMap[e.Index]; ok && len(ef.ChunkBitmap) > 0 {
+					loadedBmp, err := protocol.FromBytes(chunkCount, ef.ChunkBitmap)
+					if err == nil {
+						bmp = loadedBmp
+					}
+				}
+			}
+			if bmp == nil {
+				bmp = protocol.NewBitmap(chunkCount)
+			}
 			bitmaps[e.Index] = bmp
+
+			// Calculate previously received bytes from this bitmap
+			if bmp.IsComplete() {
+				initialBytesReceived += e.Size
+			} else {
+				for c := 0; c < chunkCount; c++ {
+					if bmp.Has(c) {
+						if c == chunkCount-1 {
+							initialBytesReceived += (e.Size - int64(c)*offer.ChunkSize)
+						} else {
+							initialBytesReceived += offer.ChunkSize
+						}
+					}
+				}
+			}
 
 			// Create parent directory if needed
 			os.MkdirAll(filepath.Dir(fullDestPath), 0755)
 
 			// Open or create .lvpart file
 			partPath := fullDestPath + ".lvpart"
-			f, err := os.OpenFile(partPath, os.O_CREATE|os.O_RDWR, 0644)
-			if err != nil {
-				return fmt.Errorf("failed to open part file %s: %w", partPath, err)
+			if _, err := os.Stat(fullDestPath); err == nil && bmp.IsComplete() {
+				// Already finalized in previous session
+				initialCompletedFiles++
+			} else {
+				f, err := os.OpenFile(partPath, os.O_CREATE|os.O_RDWR, 0644)
+				if err != nil {
+					return fmt.Errorf("failed to open part file %s: %w", partPath, err)
+				}
+				partFiles[e.Index] = f
+				if bmp.IsComplete() {
+					f.Sync()
+					f.Close()
+					delete(partFiles, e.Index)
+					if err := os.Rename(partPath, fullDestPath); err == nil {
+						initialCompletedFiles++
+					}
+				}
 			}
-			partFiles[e.Index] = f
 
 			fileRecords = append(fileRecords, store.TransferFileRecord{
 				TransferID:  offer.TransferID,
@@ -438,7 +491,7 @@ func HandleIncomingControl(
 				MtimeMs:     e.MtimeMs,
 				ChunkCount:  chunkCount,
 				ChunkBitmap: bmp.Bytes(),
-				IsCompleted: false,
+				IsCompleted: bmp.IsComplete(),
 			})
 		}
 	}
@@ -469,7 +522,8 @@ func HandleIncomingControl(
 		StreamToken:    streamToken,
 		DataStreams:    dataStreams,
 		Bitmaps:        bitmaps,
-		FilesCompleted: 0,
+		FilesCompleted: initialCompletedFiles,
+		BytesReceived:  initialBytesReceived,
 		store:          st,
 		controlConn:    tlsConn,
 		partFiles:      partFiles,
@@ -618,9 +672,13 @@ func (s *ReceiverSession) handleDataFrame(payload []byte) error {
 	// Update bitmap
 	bmp, ok := s.Bitmaps[int(df.FileIndex)]
 	if ok {
-		bmp.Set(int(df.ChunkIndex))
+		if !bmp.Has(int(df.ChunkIndex)) {
+			bmp.Set(int(df.ChunkIndex))
+			s.BytesReceived += int64(len(df.Data))
+		}
+	} else {
+		s.BytesReceived += int64(len(df.Data))
 	}
-	s.BytesReceived += int64(len(df.Data))
 
 	// Queue ACK
 	ackPair := protocol.IndexPair{FileIndex: df.FileIndex, ChunkIndex: df.ChunkIndex}

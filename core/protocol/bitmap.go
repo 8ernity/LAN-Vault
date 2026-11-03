@@ -70,6 +70,11 @@ func (b *Bitmap) IsSet(chunkIndex int) bool {
 	return (b.bytes[byteIdx] & (1 << bitIdx)) != 0
 }
 
+// Has returns true if chunkIndex is completed (alias for IsSet)
+func (b *Bitmap) Has(chunkIndex int) bool {
+	return b.IsSet(chunkIndex)
+}
+
 // CompletedCount returns the number of completed chunks
 func (b *Bitmap) CompletedCount() int {
 	count := 0

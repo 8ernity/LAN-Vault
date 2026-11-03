@@ -10,21 +10,23 @@ import {
   Check, 
   Sliders 
 } from 'lucide-react';
-import { discovery, main } from '../../wailsjs/go/models';
+import { discovery, main, store } from '../../wailsjs/go/models';
 
 interface SendTabProps {
   nearbyDevices: discovery.DiscoveredPeer[];
   selectedDevice: discovery.DiscoveredPeer | null;
+  trustedDevices?: store.TrustedDevice[];
   onSelectDevice: (device: discovery.DiscoveredPeer) => void;
   onPickFiles: () => Promise<string[]>;
   onPickFolder: () => Promise<string>;
   onScanItems: (paths: string[]) => Promise<main.ScannedSelection>;
-  onStartTransfer: (targetAddr: string, paths: string[]) => Promise<void>;
+  onStartTransfer: (targetAddr: string, paths: string[], peerFingerprint: string) => Promise<void>;
 }
 
 export const SendTab: React.FC<SendTabProps> = ({
   nearbyDevices,
   selectedDevice,
+  trustedDevices = [],
   onSelectDevice,
   onPickFiles,
   onPickFolder,
@@ -84,10 +86,12 @@ export const SendTab: React.FC<SendTabProps> = ({
   const handleSend = async () => {
     const target = manualAddr || (selectedDevice ? `${selectedDevice.ips[0]}:${selectedDevice.port}` : '');
     if (!target || selectedPaths.length === 0) return;
+    const trusted = selectedDevice ? trustedDevices.find((t) => t.device_id === selectedDevice.device_id) : undefined;
+    const peerFp = manualAddr ? '' : (trusted?.fingerprint || '');
 
     setIsSending(true);
     try {
-      await onStartTransfer(target, selectedPaths);
+      await onStartTransfer(target, selectedPaths, peerFp);
     } finally {
       setIsSending(false);
     }

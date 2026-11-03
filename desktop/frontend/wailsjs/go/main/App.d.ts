@@ -31,6 +31,6 @@ export function RunDiagnostics():Promise<Array<diag.DiagnosticResult>>;
 
 export function ScanItems(arg1:Array<string>):Promise<main.ScannedSelection>;
 
-export function StartSend(arg1:string,arg2:Array<string>):Promise<void>;
+export function StartSend(arg1:string,arg2:Array<string>,arg3:string):Promise<void>;
 
 export function UpdateSetting(arg1:string,arg2:string):Promise<void>;

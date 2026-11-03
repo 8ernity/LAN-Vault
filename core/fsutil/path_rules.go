@@ -123,6 +123,53 @@ func numberedName(name string, n int) string {
 	return fmt.Sprintf("%s (%d)%s", name[:i], n, name[i:])
 }
 
+// joinPath joins a planned parent directory and a segment using the wire
+// separator. The empty parent is treated as the destination root.
+func joinPath(parent, name string) string {
+	if parent == "" {
+		return name
+	}
+	return parent + "/" + name
+}
+
+// dirNameResolver merges directory names case-insensitively (Windows profile)
+// and keeps the first spelling encountered. Reserved directories are therefore
+// known before any file collision suffix is assigned, regardless of manifest
+// entry order.
+type dirNameResolver struct {
+	profile string
+	names   map[string]string // osKey(parent) + "\x00" + osKey(segment) -> display
+}
+
+func newDirNameResolver(profile string) *dirNameResolver {
+	return &dirNameResolver{profile: profile, names: make(map[string]string)}
+}
+
+func (r *dirNameResolver) resolve(parent, segment string) string {
+	k := osKey(parent, r.profile) + "\x00" + osKey(segment, r.profile)
+	if display, ok := r.names[k]; ok {
+		return display
+	}
+	r.names[k] = segment
+	return segment
+}
+
+// ResolveDirectoryPath resolves every directory segment of a wire path and
+// returns the planned directory path. A file's final segment is included only
+// when includeLast is true.
+func (r *dirNameResolver) ResolveDirectoryPath(segments []string, includeLast bool) string {
+	parent := ""
+	limit := len(segments)
+	if !includeLast && limit > 0 {
+		limit--
+	}
+	for i := 0; i < limit; i++ {
+		display := r.resolve(parent, segments[i])
+		parent = joinPath(parent, display)
+	}
+	return parent
+}
+
 // EntryInput represents an incoming entry in manifest planning
 type EntryInput struct {
 	Type string // "file" or "dir"
@@ -166,6 +213,8 @@ func PlanManifest(entries []EntryInput, profile string) (paths []string, rejectR
 		seen[k] = true
 	}
 
+	// Raw (wire-level) file/directory conflicts. These are independent of the
+	// destination profile and must be rejected before any filesystem work.
 	files := make(map[string]bool)
 	dirs := make(map[string]bool)
 	parents := make(map[string]bool)
@@ -181,123 +230,110 @@ func PlanManifest(entries []EntryInput, profile string) (paths []string, rejectR
 			parents[strings.Join(parts[:i], "/")] = true
 		}
 	}
-
 	for f := range files {
 		if dirs[f] || parents[f] {
 			return nil, "file_dir_conflict", nil
 		}
 	}
 
-	directoryNames := make(map[dirKey]string)
-	reservedDirectories := make(map[string]bool)
-	var prepared []preparedEntry
-
-	for _, e := range entries {
-		segments := strings.Split(e.Path, "/")
-		sanitizedSegments := make([]string, len(segments))
-		for i, s := range segments {
-			sanitizedSegments[i] = SanitizeSegment(s, profile)
-		}
-
-		parent := ""
-		for i, s := range sanitizedSegments {
-			isDir := i < len(sanitizedSegments)-1 || e.Type == "dir"
-			if isDir {
-				k := dirKey{parent: parent, segKey: osKey(s, profile)}
-				display, exists := directoryNames[k]
-				if !exists {
-					display = s
-					directoryNames[k] = s
-				}
-				var path string
-				if parent != "" {
-					path = parent + "/" + display
-				} else {
-					path = display
-				}
-				reservedDirectories[osKey(path, profile)] = true
-				parent = path
-			} else {
-				var targetPath string
-				if parent != "" {
-					targetPath = parent + "/" + s
-				} else {
-					targetPath = s
-				}
-				if reservedDirectories[osKey(targetPath, profile)] {
-					return nil, "file_dir_conflict", nil
-				}
-				prepared = append(prepared, preparedEntry{
-					isDir:    false,
-					parent:   parent,
-					basename: s,
-				})
-			}
-		}
-		if e.Type == "dir" {
-			prepared = append(prepared, preparedEntry{
-				isDir:     true,
-				directory: parent,
-			})
-		}
+	// Normalize and sanitize every segment before planning. Directory names are
+	// resolved first so the full directory namespace is reserved before any
+	// file collision suffix can be assigned. This makes the decision
+	// independent of manifest entry order (PROTOCOL 10.5).
+	resolver := newDirNameResolver(profile)
+	type entryPlan struct {
+		entry        EntryInput
+		segments     []string
+		parent       string
+		baseName     string
+		resolvedName string
 	}
-
-	usedFiles := make(map[string]bool)
-	var result []string
-
-	for _, p := range prepared {
-		if p.isDir {
-			result = append(result, p.directory)
-			continue
-		}
-
-		var basePath string
-		if p.parent != "" {
-			basePath = p.parent + "/" + p.basename
-		} else {
-			basePath = p.basename
-		}
-		if reservedDirectories[osKey(basePath, profile)] {
-			return nil, "file_dir_conflict", nil
-		}
-
-		candidate := p.basename
-		n := 0
-		var path string
-		var key string
-
-		for {
-			if p.parent != "" {
-				path = p.parent + "/" + candidate
-			} else {
-				path = candidate
-			}
-			key = osKey(path, profile)
-			if !usedFiles[key] && !reservedDirectories[key] {
-				break
-			}
-			n++
-			candidate = numberedName(p.basename, n)
-			if len([]byte(candidate)) > MaxSegmentBytes {
+	plans := make([]entryPlan, len(entries))
+	for i, e := range entries {
+		rawSegments := strings.Split(e.Path, "/")
+		segments := make([]string, len(rawSegments))
+		for j, s := range rawSegments {
+			segments[j] = SanitizeSegment(s, profile)
+			if len([]byte(segments[j])) > MaxSegmentBytes {
 				return nil, "segment_too_long", nil
 			}
 		}
+		plans[i] = entryPlan{entry: e, segments: segments}
+	}
 
-		if len([]byte(path)) > MaxPathBytes {
-			return nil, "path_too_long", nil
+	reservedDirectories := make(map[string]bool)
+
+	// Pass 1: resolve every explicit and implied directory.
+	for _, p := range plans {
+		includeLast := p.entry.Type == "dir"
+		full := resolver.ResolveDirectoryPath(p.segments, includeLast)
+		if full != "" {
+			reservedDirectories[osKey(full, profile)] = true
 		}
-		usedFiles[key] = true
-		result = append(result, path)
+	}
+
+	// Pass 2: reject sanitized/case-folded file-vs-directory conflicts wherever
+	// the entries appear in the manifest.
+	for i := range plans {
+		p := &plans[i]
+		if p.entry.Type != "file" {
+			continue
+		}
+		p.parent = resolver.ResolveDirectoryPath(p.segments, false)
+		p.baseName = p.segments[len(p.segments)-1]
+		candidatePath := joinPath(p.parent, p.baseName)
+		if reservedDirectories[osKey(candidatePath, profile)] {
+			return nil, "file_dir_conflict", nil
+		}
+	}
+
+	// Pass 3: assign collision-safe names to files. The reserved directory
+	// namespace is authoritative for every candidate number.
+	usedFiles := make(map[string]bool)
+	for i := range plans {
+		p := &plans[i]
+		if p.entry.Type != "file" {
+			continue
+		}
+		candidate := p.baseName
+		for n := 0; ; n++ {
+			if n > 0 {
+				candidate = numberedName(p.baseName, n)
+			}
+			if len([]byte(candidate)) > MaxSegmentBytes {
+				return nil, "segment_too_long", nil
+			}
+			path := joinPath(p.parent, candidate)
+			if len([]byte(path)) > MaxPathBytes {
+				return nil, "path_too_long", nil
+			}
+			key := osKey(path, profile)
+			if !usedFiles[key] && !reservedDirectories[key] {
+				usedFiles[key] = true
+				p.resolvedName = path
+				break
+			}
+		}
+	}
+
+	result := make([]string, 0, len(plans))
+	for i := range plans {
+		p := &plans[i]
+		if p.entry.Type == "dir" {
+			result = append(result, resolver.ResolveDirectoryPath(p.segments, true))
+		} else {
+			result = append(result, p.resolvedName)
+		}
 	}
 
 	for _, path := range result {
+		if len([]byte(path)) > MaxPathBytes {
+			return nil, "path_too_long", nil
+		}
 		for _, s := range strings.Split(path, "/") {
 			if len([]byte(s)) > MaxSegmentBytes {
 				return nil, "segment_too_long", nil
 			}
-		}
-		if len([]byte(path)) > MaxPathBytes {
-			return nil, "path_too_long", nil
 		}
 	}
 

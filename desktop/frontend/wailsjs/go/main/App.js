@@ -54,8 +54,8 @@ export function ScanItems(arg1) {
   return window['go']['main']['App']['ScanItems'](arg1);
 }
 
-export function StartSend(arg1, arg2) {
-  return window['go']['main']['App']['StartSend'](arg1, arg2);
+export function StartSend(arg1, arg2, arg3) {
+  return window['go']['main']['App']['StartSend'](arg1, arg2, arg3);
 }
 
 export function UpdateSetting(arg1, arg2) {

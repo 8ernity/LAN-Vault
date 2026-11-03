@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -314,40 +317,77 @@ func (a *App) ScanItems(paths []string) (*ScannedSelection, error) {
 	}, nil
 }
 
-// StartSend initiates file transfer to target
-func (a *App) StartSend(targetAddr string, paths []string) error {
+// StartSend initiates file transfer to target. expectedPeerFP pins the TLS
+// certificate of the selected peer; an empty value is only valid for the
+// explicit manual-address path, and the receiver still enforces pairing.
+func (a *App) StartSend(targetAddr string, paths []string, expectedPeerFP string) error {
 	items, totalFiles, totalBytes, manifestHash, err := transfer.ScanSourceItems(paths)
 	if err != nil {
 		return err
 	}
 
-	transferID := fmt.Sprintf("tr-%d", time.Now().UnixNano())
+	// Stable transfer IDs make retries resumable while still creating a new
+	// transfer after a previous attempt reached a terminal state.
+	seed := sha256.Sum256([]byte(manifestHash + "|" + expectedPeerFP + "|" + targetAddr))
+	baseID := "tr-" + hex.EncodeToString(seed[:16])
+	transferID := baseID
+	var createdAt = time.Now().UnixMilli()
 	if a.st != nil {
-		a.st.SaveTransfer(store.TransferRecord{
+		if existing, getErr := a.st.GetTransfer(baseID); getErr == nil && existing != nil {
+			switch existing.State {
+			case "Completed", "CompletedWithErrors", "Cancelled", "Failed":
+				transferID = fmt.Sprintf("%s-%d", baseID, time.Now().UnixNano())
+			default:
+				transferID = baseID
+				createdAt = existing.CreatedAt
+			}
+		} else if getErr != nil && !errors.Is(getErr, store.ErrNotFound) {
+			return getErr
+		}
+	}
+
+	if a.st != nil {
+		if err := a.st.SaveTransfer(store.TransferRecord{
 			TransferID:      transferID,
 			Direction:       "send",
-			PeerFingerprint: "",
+			PeerFingerprint: expectedPeerFP,
 			PeerName:        targetAddr,
 			State:           "Transferring",
 			ChunkSize:       protocol.ChunkSizeDefault,
 			TotalFiles:      totalFiles,
 			TotalBytes:      totalBytes,
 			ManifestHash:    manifestHash,
-			CreatedAt:       time.Now().UnixMilli(),
+			CreatedAt:       createdAt,
 			UpdatedAt:       time.Now().UnixMilli(),
-		})
+		}); err != nil {
+			return fmt.Errorf("record transfer start: %w", err)
+		}
 	}
 
 	go func() {
 		progressCb := func(bytesAcked int64, total int64, filesDone int, totalFiles int) {
 			runtime.EventsEmit(a.ctx, "transfer:progress", map[string]any{
+				"transferId": transferID,
 				"bytesAcked": bytesAcked,
 				"totalBytes": total,
 				"filesDone":  filesDone,
 				"totalFiles": totalFiles,
 			})
+			if a.st != nil {
+				_ = a.st.SaveTransfer(store.TransferRecord{
+					TransferID:     transferID,
+					State:          "Transferring",
+					CompletedFiles: filesDone,
+					CompletedBytes: bytesAcked,
+					UpdatedAt:      time.Now().UnixMilli(),
+				})
+			}
 		}
 
+		peerArgs := []string{}
+		if expectedPeerFP != "" {
+			peerArgs = append(peerArgs, expectedPeerFP)
+		}
 		doneOk, err := transfer.StartSend(
 			targetAddr,
 			a.id,
@@ -359,28 +399,37 @@ func (a *App) StartSend(targetAddr string, paths []string) error {
 			manifestHash,
 			protocol.ChunkSizeDefault,
 			progressCb,
+			peerArgs...,
 		)
 		if err != nil {
 			if a.st != nil {
-				a.st.SaveTransfer(store.TransferRecord{
-					TransferID: transferID,
-					State:      "Failed",
-					UpdatedAt:  time.Now().UnixMilli(),
+				_ = a.st.SaveTransfer(store.TransferRecord{
+					TransferID:   transferID,
+					State:        "Interrupted",
+					ErrorMessage: err.Error(),
+					UpdatedAt:    time.Now().UnixMilli(),
 				})
 			}
-			runtime.EventsEmit(a.ctx, "transfer:error", err.Error())
-		} else {
-			if a.st != nil {
-				a.st.SaveTransfer(store.TransferRecord{
-					TransferID:     transferID,
-					State:          "Completed",
-					CompletedFiles: doneOk.FilesCompleted,
-					CompletedBytes: doneOk.Bytes,
-					UpdatedAt:      time.Now().UnixMilli(),
-				})
-			}
-			runtime.EventsEmit(a.ctx, "transfer:completed", doneOk)
+			runtime.EventsEmit(a.ctx, "transfer:error", map[string]any{
+				"transferId": transferID,
+				"error":      err.Error(),
+			})
+			return
 		}
+		if a.st != nil {
+			_ = a.st.SaveTransfer(store.TransferRecord{
+				TransferID:     transferID,
+				State:          "Completed",
+				CompletedFiles: doneOk.FilesCompleted,
+				CompletedBytes: doneOk.Bytes,
+				UpdatedAt:      time.Now().UnixMilli(),
+			})
+		}
+		runtime.EventsEmit(a.ctx, "transfer:completed", map[string]any{
+			"transferId":     transferID,
+			"filesCompleted": doneOk.FilesCompleted,
+			"bytes":          doneOk.Bytes,
+		})
 	}()
 
 	return nil

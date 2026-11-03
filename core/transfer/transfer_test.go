@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"lanvault/core/identity"
 	"lanvault/core/protocol"
@@ -25,6 +26,13 @@ func TestEndToEndTransfer(t *testing.T) {
 	file2Path := filepath.Join(subDir, "large.bin")
 	largeData := bytes.Repeat([]byte("LANVaultChunkTestData1234567890"), 10000) // ~300 KB
 	os.WriteFile(file2Path, largeData, 0644)
+
+	// Empty files and directories are legal manifest entries and must be
+	// finalized without writing a DATA frame.
+	emptyFile := filepath.Join(sourceDir, "empty.txt")
+	os.WriteFile(emptyFile, []byte{}, 0644)
+	emptyDir := filepath.Join(sourceDir, "empty-dir")
+	os.MkdirAll(emptyDir, 0755)
 
 	destDir := t.TempDir()
 
@@ -44,6 +52,20 @@ func TestEndToEndTransfer(t *testing.T) {
 		t.Fatalf("store failed: %v", err)
 	}
 	defer st.Close()
+
+	// Pair the sender before the transfer: application v1.0 requires an
+	// explicit trust decision, and the receiver's default policy rejects
+	// unpaired senders.
+	if err := st.SaveTrustedDevice(store.TrustedDevice{
+		Fingerprint: senderID.Fingerprint,
+		DeviceID:    senderID.DeviceID,
+		Name:        "TestSender",
+		Platform:    "windows",
+		PairedAt:    time.Now().UnixMilli(),
+		LastSeen:    time.Now().UnixMilli(),
+	}); err != nil {
+		t.Fatalf("pair sender failed: %v", err)
+	}
 
 	// 4. Start receiver listener
 	serverTLS := receiverID.ServerTLSConfig()
@@ -98,13 +120,14 @@ func TestEndToEndTransfer(t *testing.T) {
 		manifestHash,
 		chunkSize,
 		nil,
+		receiverID.Fingerprint,
 	)
 	if err != nil {
 		t.Fatalf("StartSend failed: %v", err)
 	}
 
-	if doneOk.FilesCompleted != 2 {
-		t.Errorf("files completed mismatch: got %d, want 2", doneOk.FilesCompleted)
+	if doneOk.FilesCompleted != 3 {
+		t.Errorf("files completed mismatch: got %d, want 3", doneOk.FilesCompleted)
 	}
 
 	if err := <-errChan; err != nil {
@@ -132,6 +155,13 @@ func TestEndToEndTransfer(t *testing.T) {
 	recHash := sha256.Sum256(rec2Data)
 	if origHash != recHash {
 		t.Errorf("file2 SHA-256 mismatch: got %s, want %s", hex.EncodeToString(recHash[:]), hex.EncodeToString(origHash[:]))
+	}
+
+	if info, err := os.Stat(filepath.Join(destDir, filepath.Base(sourceDir), "empty.txt")); err != nil || info.Size() != 0 {
+		t.Errorf("empty file was not finalized correctly: info=%v err=%v", info, err)
+	}
+	if info, err := os.Stat(filepath.Join(destDir, filepath.Base(sourceDir), "empty-dir")); err != nil || !info.IsDir() {
+		t.Errorf("empty directory was not created: info=%v err=%v", info, err)
 	}
 
 	t.Logf("End-to-end file transfer verified: %d files, %d bytes identical!", doneOk.FilesCompleted, doneOk.Bytes)

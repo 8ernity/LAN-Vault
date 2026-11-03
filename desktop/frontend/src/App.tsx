@@ -161,7 +161,8 @@ function App() {
     });
 
     EventsOn('transfer:error', (err: any) => {
-      showToast(`Transfer error: ${err}`, 'error');
+      const text = typeof err === 'string' ? err : (err?.error || err?.message || JSON.stringify(err));
+      showToast(`Transfer error: ${text}`, 'error');
       setActiveProgress(null);
       loadRecentTransfers();
     });
@@ -358,12 +359,13 @@ function App() {
             <SendTab
               nearbyDevices={nearbyDevices}
               selectedDevice={selectedDevice}
+              trustedDevices={trustedDevices}
               onSelectDevice={setSelectedDevice}
               onPickFiles={PickFiles}
               onPickFolder={PickFolder}
               onScanItems={ScanItems}
-              onStartTransfer={async (addr, paths) => {
-                await StartSend(addr, paths);
+              onStartTransfer={async (addr, paths, peerFp) => {
+                await StartSend(addr, paths, peerFp);
                 setActiveTab('transfers');
               }}
             />

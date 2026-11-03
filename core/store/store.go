@@ -152,6 +152,15 @@ func (s *Store) migrate() error {
 		FOREIGN KEY (transfer_id) REFERENCES transfers(transfer_id) ON DELETE CASCADE
 	);
 
+	CREATE TABLE IF NOT EXISTS transfer_chunks (
+		transfer_id TEXT NOT NULL,
+		file_index INTEGER NOT NULL,
+		chunk_index INTEGER NOT NULL,
+		chunk_hash BLOB NOT NULL,
+		PRIMARY KEY (transfer_id, file_index, chunk_index),
+		FOREIGN KEY (transfer_id, file_index) REFERENCES transfer_files(transfer_id, file_index) ON DELETE CASCADE
+	);
+
 	CREATE TABLE IF NOT EXISTS settings (
 		key TEXT PRIMARY KEY,
 		value TEXT NOT NULL
@@ -373,6 +382,117 @@ func (s *Store) UpdateFileBitmap(transferID string, fileIndex int, bitmap []byte
 	query := `UPDATE transfer_files SET chunk_bitmap = ?, is_completed = ? WHERE transfer_id = ? AND file_index = ?`
 	_, err := s.db.Exec(query, bitmap, isComp, transferID, fileIndex)
 	return err
+}
+
+// SaveChunkHash records the SHA-256 of a verified chunk. This is the durable
+// evidence used to re-validate resume state before a file is finalized.
+func (s *Store) SaveChunkHash(transferID string, fileIndex, chunkIndex int, hash []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+	INSERT INTO transfer_chunks (transfer_id, file_index, chunk_index, chunk_hash)
+	VALUES (?, ?, ?, ?)
+	ON CONFLICT(transfer_id, file_index, chunk_index) DO UPDATE SET chunk_hash = excluded.chunk_hash
+	`
+	_, err := s.db.Exec(query, transferID, fileIndex, chunkIndex, hash)
+	return err
+}
+
+// GetChunkHashes returns chunk_index -> SHA-256 for one file.
+func (s *Store) GetChunkHashes(transferID string, fileIndex int) (map[int][]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(
+		`SELECT chunk_index, chunk_hash FROM transfer_chunks WHERE transfer_id = ? AND file_index = ?`,
+		transferID, fileIndex,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[int][]byte)
+	for rows.Next() {
+		var idx int
+		var hash []byte
+		if err := rows.Scan(&idx, &hash); err != nil {
+			return nil, err
+		}
+		copied := make([]byte, len(hash))
+		copy(copied, hash)
+		result[idx] = copied
+	}
+	return result, rows.Err()
+}
+
+// UpdateFileFinalPath persists the collision-resolved final path.
+func (s *Store) UpdateFileFinalPath(transferID string, fileIndex int, finalPath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		`UPDATE transfer_files SET final_path = ? WHERE transfer_id = ? AND file_index = ?`,
+		finalPath, transferID, fileIndex,
+	)
+	return err
+}
+
+// GetTransferByManifestAndPeer finds an unfinished transfer matching the
+// resume binding (manifest hash + peer fingerprint). Used by the sender to
+// reuse a stable transfer_id after a restart.
+func (s *Store) GetTransferByManifestAndPeer(manifestHash, peerFP, direction string) (*TransferRecord, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	query := `
+	SELECT transfer_id, direction, peer_fingerprint, peer_name, peer_device_id, state,
+	       chunk_size, total_files, total_bytes, completed_files, completed_bytes,
+	       manifest_hash, created_at, updated_at, coalesce(error_message, '')
+	FROM transfers
+	WHERE manifest_hash = ? AND peer_fingerprint = ? AND direction = ?
+	  AND state NOT IN ('Completed', 'Cancelled', 'CompletedWithErrors')
+	ORDER BY created_at DESC LIMIT 1
+	`
+	row := s.db.QueryRow(query, manifestHash, peerFP, direction)
+	var t TransferRecord
+	err := row.Scan(
+		&t.TransferID, &t.Direction, &t.PeerFingerprint, &t.PeerName, &t.PeerDeviceID, &t.State,
+		&t.ChunkSize, &t.TotalFiles, &t.TotalBytes, &t.CompletedFiles, &t.CompletedBytes,
+		&t.ManifestHash, &t.CreatedAt, &t.UpdatedAt, &t.ErrorMessage,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+// DeleteTransfer removes a transfer and all dependent file/chunk state. It is
+// used only when the same peer re-binds an unfinished transfer_id to a new
+// manifest; state belonging to a different peer is never deleted.
+func (s *Store) DeleteTransfer(transferID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM transfer_chunks WHERE transfer_id = ?`, transferID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM transfer_files WHERE transfer_id = ?`, transferID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM transfers WHERE transfer_id = ?`, transferID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // GetTransferFiles returns all file records for a transfer

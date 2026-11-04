@@ -43,6 +43,7 @@ import com.example.lanvault.data.VaultDatabase
 import com.example.lanvault.discovery.DiscoveredPeer
 import com.example.lanvault.protocol.Protocol
 import com.example.lanvault.service.TransferForegroundService
+import com.example.lanvault.ui.pairing.PairingViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -839,37 +840,33 @@ fun ReceiveScreen(
     onChangeSaveLocation: () -> Unit,
     onScanQR: () -> Unit
 ) {
+    // PC-02-B: Use ViewModel for QR lifecycle management
+    val viewModel = remember { PairingViewModel() }
+    val pairingState by viewModel.state.collectAsState()
     val localIps = remember { getLocalIpAddresses() }
-    var countdown by remember { mutableStateOf(Protocol.PAIR_TOKEN_TTL_S.toInt()) }
-    var qrContent by remember { mutableStateOf("") }
 
-    val refreshQR = remember(identity, deviceName, localIps, service) {
-        {
-            val newQr = service?.transferEngine?.generatePairingQR(localIps, deviceName)
-                ?: run {
-                    val ipStr = localIps.joinToString(",")
-                    val encodedName = java.net.URLEncoder.encode(deviceName, "UTF-8")
-                    "lanvault://pair?v=1&fp=${identity.fingerprint}&ip=$ipStr&port=${Protocol.DEFAULT_PORT}&name=$encodedName&tok="
-                }
-            qrContent = newQr
-            countdown = Protocol.PAIR_TOKEN_TTL_S.toInt()
-        }
-    }
-
+    // Initialize QR on first composition
     LaunchedEffect(identity, deviceName, localIps, service) {
-        refreshQR()
-        while (true) {
-            delay(1000L)
-            if (countdown > 1) {
-                countdown -= 1
-            } else {
-                refreshQR()
-            }
+        viewModel.refreshQR(identity, deviceName, localIps, service?.transferEngine)
+    }
+
+    // Auto-refresh when countdown reaches 0
+    LaunchedEffect(pairingState.remainingSeconds) {
+        if (pairingState.remainingSeconds <= 0 && !pairingState.isRefreshing) {
+            viewModel.refreshQR(identity, deviceName, localIps, service?.transferEngine)
         }
     }
 
-    val qrBitmap = remember(qrContent) {
-        if (qrContent.isNotEmpty()) QRHelper.generateQRCode(qrContent, 512)
+    // Pause/resume countdown based on lifecycle
+    DisposableEffect(Unit) {
+        viewModel.resumeCountdown()
+        onDispose {
+            viewModel.pauseCountdown()
+        }
+    }
+
+    val qrBitmap = remember(pairingState.qrContent) {
+        if (pairingState.qrContent.isNotEmpty()) QRHelper.generateQRCode(pairingState.qrContent, 512)
         else Bitmap.createBitmap(512, 512, Bitmap.Config.ARGB_8888)
     }
 
@@ -893,13 +890,13 @@ fun ReceiveScreen(
             horizontalArrangement = Arrangement.Center
         ) {
             Text(
-                text = "Refreshes in ${countdown}s",
+                text = "Refreshes in ${pairingState.remainingSeconds}s",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontSize = 12.sp
             )
             Spacer(modifier = Modifier.width(6.dp))
             IconButton(
-                onClick = { refreshQR() },
+                onClick = { viewModel.manualRefresh(identity, deviceName, localIps, service?.transferEngine) },
                 modifier = Modifier.size(24.dp)
             ) {
                 Icon(

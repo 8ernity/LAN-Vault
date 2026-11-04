@@ -246,7 +246,8 @@ private class IncomingTransferSession(
                 val full = PathPlanner.safeJoin(fileRoot!!, planned)
                 full.parentFile?.mkdirs()
                 targetFiles[entry.index] = full
-                val part = File(full.parentFile, "${full.name}.${transferId.take(8)}.lvpart")
+                // PC-05-A: Use collision-safe temp file name
+                val part = PathPlanner.getTempFileName(full, transferId)
                 partFiles[entry.index] = part
                 val hashes = if (isResume) loadHashes(entry.index) else emptyMap()
                 if (full.exists() && bitmap.isComplete() && count > 0 && hashes.size == count) {

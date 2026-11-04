@@ -196,6 +196,37 @@ object PathPlanner {
         }
     }
 
+    /**
+     * Returns a safe temp file name for chunked transfers.
+     * Checks for collisions with both the final file and any existing .lvpart variants.
+     * PC-05-A: Prevents temp file collision between concurrent transfers.
+     * 
+     * @param finalFile The target final file location
+     * @param transferId Transfer identifier (first 8 chars used in name)
+     * @return A File object for the temp file that doesn't currently exist
+     */
+    fun getTempFileName(finalFile: File, transferId: String): File {
+        val parent = finalFile.parentFile ?: throw IOException("finalFile has no parent directory")
+        val baseName = finalFile.name
+        val transferPrefix = transferId.take(8)
+        
+        // Check primary temp file name
+        val primaryTemp = File(parent, "$baseName.$transferPrefix.lvpart")
+        if (!primaryTemp.exists()) {
+            return primaryTemp
+        }
+        
+        // If collision, append counter
+        for (i in 1..9999) {
+            val candidate = File(parent, "$baseName.$transferPrefix.$i.lvpart")
+            if (!candidate.exists()) {
+                return candidate
+            }
+        }
+        
+        throw IOException("no available temp file name for $baseName")
+    }
+
     /** Resolves a planned path beneath [root] without following symlinks. */
     fun safeJoin(root: File, relativePath: String): File {
         val rootCanonical = root.canonicalFile

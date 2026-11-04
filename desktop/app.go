@@ -309,6 +309,33 @@ func (a *App) GetPairingQR() (string, error) {
 	return pairing.GenerateURI(protocol.ProtocolMajor, a.id.Fingerprint, ips, protocol.DefaultPort, a.deviceName, tok), nil
 }
 
+// GetPairingQRWithTTL returns QR URI with time-to-live information.
+// If active token exists and has not expired, returns existing token with remaining seconds.
+// If no active token or expired, creates fresh token with full TTL.
+// PC-02-A: Desktop QR token lifecycle synchronization with Android countdown.
+func (a *App) GetPairingQRWithTTL() (qrURI string, remainingSec int, err error) {
+	// Check if active token exists
+	existingToken, remaining := a.pairingMgr.GetActiveTokenInfo()
+	
+	var token []byte
+	if existingToken != nil && remaining > 0 {
+		// Reuse existing token
+		token = existingToken
+		remainingSec = remaining
+	} else {
+		// Create fresh token
+		token, err = a.pairingMgr.CreateNewToken()
+		if err != nil {
+			return "", 0, err
+		}
+		remainingSec = protocol.PairTokenTTLSec
+	}
+	
+	ips := netutil.GetLocalIPStrings()
+	qrURI = pairing.GenerateURI(protocol.ProtocolMajor, a.id.Fingerprint, ips, protocol.DefaultPort, a.deviceName, token)
+	return qrURI, remainingSec, nil
+}
+
 // PickFiles opens file dialog
 func (a *App) PickFiles() ([]string, error) {
 	paths, err := runtime.OpenMultipleFilesDialog(a.ctx, runtime.OpenDialogOptions{

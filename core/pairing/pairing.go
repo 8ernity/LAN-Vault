@@ -188,6 +188,27 @@ func (m *Manager) VerifyToken(receivedTokB64 string) error {
 	return nil
 }
 
+// GetActiveTokenInfo returns the active token and time remaining in seconds.
+// Returns nil, 0 if no active token or token has expired.
+// PC-02-A: Desktop QR token lifecycle management
+func (m *Manager) GetActiveTokenInfo() (token []byte, remainingSec int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.active == nil {
+		return nil, 0
+	}
+
+	elapsed := time.Since(m.active.CreatedAt)
+	if elapsed > m.ttl {
+		m.active = nil
+		return nil, 0
+	}
+
+	remaining := m.ttl - elapsed
+	return m.active.Token, int(remaining.Seconds())
+}
+
 // CancelSession invalidates current token
 func (m *Manager) CancelSession() {
 	m.mu.Lock()

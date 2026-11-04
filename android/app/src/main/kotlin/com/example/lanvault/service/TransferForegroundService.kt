@@ -15,6 +15,7 @@ import com.example.lanvault.data.VaultDatabase
 import com.example.lanvault.discovery.DiscoveryService
 import com.example.lanvault.transfer.TransferEngine
 import com.example.lanvault.transfer.TransferProgress
+import com.example.lanvault.transfer.TransferStateManager
 import kotlinx.coroutines.*
 import java.io.File
 
@@ -30,6 +31,7 @@ class TransferForegroundService : Service() {
     lateinit var db: VaultDatabase
     lateinit var transferEngine: TransferEngine
     lateinit var discovery: DiscoveryService
+    private lateinit var stateManager: TransferStateManager
 
     var activeProgress: TransferProgress? = null
         private set
@@ -51,6 +53,7 @@ class TransferForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         db = VaultDatabase(this)
+        stateManager = TransferStateManager(db)
         val identity = IdentityManager.getOrCreateIdentity(this)
 
         createNotificationChannels()
@@ -73,16 +76,37 @@ class TransferForegroundService : Service() {
             onProgress = { p ->
                 activeProgress = p
                 updateNotificationProgress(p)
+                // Thread-safe progress update using TransferStateManager
+                scope.launch {
+                    stateManager.updateProgress(
+                        transferId = p.transferId,
+                        completedFiles = p.filesDone,
+                        completedBytes = p.bytesAcked
+                    )
+                }
             }
             onCompleted = { id ->
                 activeProgress = null
-                db.updateTransferProgress(id, 0, 0, "completed")
+                // Thread-safe completion using TransferStateManager
+                scope.launch {
+                    val transfer = db.getTransfer(id)
+                    if (transfer != null) {
+                        stateManager.markCompleted(
+                            transferId = id,
+                            completedFiles = transfer.totalFiles,
+                            completedBytes = transfer.totalBytes
+                        )
+                    }
+                }
                 showCompletedNotification()
                 stopForeground(STOP_FOREGROUND_REMOVE)
             }
             onError = { id, err ->
                 activeProgress = null
-                db.updateTransferProgress(id, 0, 0, "failed")
+                // Thread-safe error handling using TransferStateManager
+                scope.launch {
+                    stateManager.markFailed(id, err)
+                }
                 stopForeground(STOP_FOREGROUND_REMOVE)
             }
         }
@@ -112,7 +136,16 @@ class TransferForegroundService : Service() {
             }
             else -> {
                 val notif = buildServiceNotification("LANVault service ready")
-                startForeground(NOTIFICATION_ID_SERVICE, notif)
+                // PC-04-A: Android API 29+ foreground service type specification
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    startForeground(
+                        NOTIFICATION_ID_SERVICE,
+                        notif,
+                        android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                    )
+                } else {
+                    startForeground(NOTIFICATION_ID_SERVICE, notif)
+                }
             }
         }
         return START_STICKY
@@ -130,8 +163,14 @@ class TransferForegroundService : Service() {
 
     // Android 15 dataSync service timeout handling (PRD line 216 & line 575)
     override fun onTimeout(startId: Int, fgsType: Int) {
-        activeProgress?.let {
-            db.updateTransferProgress(it.transferId, it.filesDone, it.bytesAcked, "paused_timeout")
+        activeProgress?.let { p ->
+            // Thread-safe pause using TransferStateManager
+            scope.launch {
+                stateManager.markPaused(
+                    transferId = p.transferId,
+                    reason = "Android 15 foreground service timeout (PC-04)"
+                )
+            }
         }
         stopSelf()
     }

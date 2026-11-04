@@ -5,8 +5,8 @@
 *.so
 *.dylib
 *.bin
-build/
-bin/
+/build/
+/bin/
 
 # Temporary and backup files
 *.tmp

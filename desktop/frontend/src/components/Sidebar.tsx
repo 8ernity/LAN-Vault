@@ -1,4 +1,5 @@
 import React from 'react';
+import logoImg from '../assets/images/logo-universal.png';
 import { 
   Shield, 
   LayoutDashboard, 
@@ -65,19 +66,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
         gap: '10px',
         padding: '8px 12px 20px 12px',
       }}>
-        <div style={{
-          width: '32px',
-          height: '32px',
-          borderRadius: 'var(--radius-control)',
-          backgroundColor: 'var(--accent-default)',
-          color: 'var(--accent-onAccent)',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          boxShadow: '0 2px 8px rgba(76, 141, 255, 0.3)'
-        }}>
-          <Shield size={18} />
-        </div>
+        <img
+          src={logoImg}
+          alt="LANVault"
+          style={{
+            width: '32px',
+            height: '32px',
+            borderRadius: 'var(--radius-control)',
+            objectFit: 'contain',
+            boxShadow: '0 2px 8px rgba(76, 141, 255, 0.25)'
+          }}
+        />
         <div>
           <div style={{ fontWeight: 700, fontSize: '16px', letterSpacing: '-0.3px' }}>
             LANVault

@@ -26,6 +26,10 @@ export function ListTrustedDevices() {
   return window['go']['main']['App']['ListTrustedDevices']();
 }
 
+export function PairWithURI(arg1) {
+  return window['go']['main']['App']['PairWithURI'](arg1);
+}
+
 export function PickFiles() {
   return window['go']['main']['App']['PickFiles']();
 }

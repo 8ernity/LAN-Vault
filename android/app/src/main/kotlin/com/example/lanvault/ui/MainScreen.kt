@@ -28,12 +28,14 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.documentfile.provider.DocumentFile
+import com.example.lanvault.R
 import com.example.lanvault.crypto.IdentityManager
 import com.example.lanvault.data.TransferRecord
 import com.example.lanvault.data.TrustedDevice
@@ -156,19 +158,29 @@ fun MainScreen(
         topBar = {
             TopAppBar(
                 title = {
-                    Column {
-                        Text("LANVault", fontWeight = FontWeight.Bold, fontSize = 18.sp)
-                        Text(
-                            text = when (currentTab) {
-                                NavTab.HOME -> "Network Vault"
-                                NavTab.SEND -> "Send Files"
-                                NavTab.RECEIVE -> "Receive Files"
-                                NavTab.TRANSFERS -> "Transfer History"
-                                NavTab.DEVICES -> "Trusted Devices"
-                            },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Image(
+                            painter = painterResource(id = R.drawable.ic_logo),
+                            contentDescription = "LANVault Logo",
+                            modifier = Modifier
+                                .size(32.dp)
+                                .clip(RoundedCornerShape(8.dp))
                         )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column {
+                            Text("LANVault", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                            Text(
+                                text = when (currentTab) {
+                                    NavTab.HOME -> "Network Vault"
+                                    NavTab.SEND -> "Send Files"
+                                    NavTab.RECEIVE -> "Receive Files"
+                                    NavTab.TRANSFERS -> "Transfer History"
+                                    NavTab.DEVICES -> "Trusted Devices"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                     }
                 },
                 actions = {

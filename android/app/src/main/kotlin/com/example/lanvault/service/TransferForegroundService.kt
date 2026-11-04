@@ -3,10 +3,12 @@ package com.example.lanvault.service
 import android.app.*
 import android.content.Context
 import android.content.Intent
+import android.graphics.BitmapFactory
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import com.example.lanvault.R
 import com.example.lanvault.crypto.IdentityManager
 import com.example.lanvault.data.TransferRecord
 import com.example.lanvault.data.VaultDatabase
@@ -232,10 +234,12 @@ class TransferForegroundService : Service() {
     }
 
     private fun buildServiceNotification(text: String): Notification {
+        val largeIcon = try { BitmapFactory.decodeResource(resources, R.drawable.ic_logo) } catch (_: Exception) { null }
         return NotificationCompat.Builder(this, CHANNEL_SERVICE)
             .setContentTitle("LANVault")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .apply { if (largeIcon != null) setLargeIcon(largeIcon) }
             .setOngoing(true)
             .build()
     }
@@ -244,11 +248,13 @@ class TransferForegroundService : Service() {
         val pct = if (p.totalBytes > 0) ((p.bytesAcked * 100) / p.totalBytes).toInt() else 0
         val mbPerSec = p.speedBps / 1_000_000.0
         val text = "${p.filesDone}/${p.totalFiles} files · ${String.format("%.1f", mbPerSec)} MB/s"
+        val largeIcon = try { BitmapFactory.decodeResource(resources, R.drawable.ic_logo) } catch (_: Exception) { null }
 
         val notif = NotificationCompat.Builder(this, CHANNEL_PROGRESS)
             .setContentTitle("Transferring ($pct%)")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.stat_sys_download)
+            .apply { if (largeIcon != null) setLargeIcon(largeIcon) }
             .setProgress(100, pct, false)
             .setOngoing(true)
             .build()
@@ -260,6 +266,7 @@ class TransferForegroundService : Service() {
     private fun showIncomingOfferNotification(senderName: String, fileCount: Int, totalBytes: Long) {
         val mb = totalBytes / 1_000_000.0
         val text = "$senderName wants to send $fileCount files (${String.format("%.1f", mb)} MB)"
+        val largeIcon = try { BitmapFactory.decodeResource(resources, R.drawable.ic_logo) } catch (_: Exception) { null }
 
         val acceptIntent = Intent(this, TransferForegroundService::class.java).apply {
             action = ACTION_ACCEPT_OFFER
@@ -275,6 +282,7 @@ class TransferForegroundService : Service() {
             .setContentTitle("Incoming LANVault Transfer")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
+            .apply { if (largeIcon != null) setLargeIcon(largeIcon) }
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
             .addAction(android.R.drawable.ic_input_add, "Accept", acceptPending)
@@ -286,10 +294,12 @@ class TransferForegroundService : Service() {
     }
 
     private fun showCompletedNotification() {
+        val largeIcon = try { BitmapFactory.decodeResource(resources, R.drawable.ic_logo) } catch (_: Exception) { null }
         val notif = NotificationCompat.Builder(this, CHANNEL_SERVICE)
             .setContentTitle("Transfer Completed")
             .setContentText("Files have been saved to Downloads/LANVault")
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
+            .apply { if (largeIcon != null) setLargeIcon(largeIcon) }
             .setAutoCancel(true)
             .build()
 

@@ -17,6 +17,8 @@ export function ListRecentTransfers(arg1:number):Promise<Array<store.TransferRec
 
 export function ListTrustedDevices():Promise<Array<store.TrustedDevice>>;
 
+export function PairWithURI(arg1:string):Promise<void>;
+
 export function PickFiles():Promise<Array<string>>;
 
 export function PickFolder():Promise<string>;

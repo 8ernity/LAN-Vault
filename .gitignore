@@ -14,6 +14,17 @@
 *.swp
 *~
 *.lvpart
+*.log
+hs_err_pid*.log
+replay_pid*.log
+
+# Internal tools & temporary audit tracking
+.kiro/
+*.docx
+AUDIT_PROGRESS.md
+COMMIT_SUMMARY.md
+HARDENING_PROGRESS.md
+VERIFICATION_CHECKLIST.md
 
 # Go
 core/coverage.out

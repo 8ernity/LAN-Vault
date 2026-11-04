@@ -42,6 +42,7 @@ import com.example.lanvault.discovery.DiscoveredPeer
 import com.example.lanvault.protocol.Protocol
 import com.example.lanvault.service.TransferForegroundService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -827,15 +828,38 @@ fun ReceiveScreen(
     onScanQR: () -> Unit
 ) {
     val localIps = remember { getLocalIpAddresses() }
-    val qrContent = remember(identity, deviceName, localIps) {
-        service?.transferEngine?.generatePairingQR(localIps, deviceName)
-            ?: run {
-                val ipStr = localIps.joinToString(",")
-                val encodedName = java.net.URLEncoder.encode(deviceName, "UTF-8")
-                "lanvault://pair?v=1&fp=${identity.fingerprint}&ip=$ipStr&port=${Protocol.DEFAULT_PORT}&name=$encodedName&tok="
-            }
+    var countdown by remember { mutableStateOf(Protocol.PAIR_TOKEN_TTL_S.toInt()) }
+    var qrContent by remember { mutableStateOf("") }
+
+    val refreshQR = remember(identity, deviceName, localIps, service) {
+        {
+            val newQr = service?.transferEngine?.generatePairingQR(localIps, deviceName)
+                ?: run {
+                    val ipStr = localIps.joinToString(",")
+                    val encodedName = java.net.URLEncoder.encode(deviceName, "UTF-8")
+                    "lanvault://pair?v=1&fp=${identity.fingerprint}&ip=$ipStr&port=${Protocol.DEFAULT_PORT}&name=$encodedName&tok="
+                }
+            qrContent = newQr
+            countdown = Protocol.PAIR_TOKEN_TTL_S.toInt()
+        }
     }
-    val qrBitmap = remember(qrContent) { QRHelper.generateQRCode(qrContent, 512) }
+
+    LaunchedEffect(identity, deviceName, localIps, service) {
+        refreshQR()
+        while (true) {
+            delay(1000L)
+            if (countdown > 1) {
+                countdown -= 1
+            } else {
+                refreshQR()
+            }
+        }
+    }
+
+    val qrBitmap = remember(qrContent) {
+        if (qrContent.isNotEmpty()) QRHelper.generateQRCode(qrContent, 512)
+        else Bitmap.createBitmap(512, 512, Bitmap.Config.ARGB_8888)
+    }
 
     Column(
         modifier = Modifier.fillMaxSize().padding(24.dp),
@@ -852,7 +876,29 @@ fun ReceiveScreen(
                 modifier = Modifier.size(220.dp).padding(12.dp)
             )
         }
-        Spacer(modifier = Modifier.height(12.dp))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center
+        ) {
+            Text(
+                text = "Refreshes in ${countdown}s",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 12.sp
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            IconButton(
+                onClick = { refreshQR() },
+                modifier = Modifier.size(24.dp)
+            ) {
+                Icon(
+                    Icons.Default.Refresh,
+                    contentDescription = "Refresh Pairing QR",
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(16.dp)
+                )
+            }
+        }
+        Spacer(modifier = Modifier.height(10.dp))
         Text(deviceName, fontWeight = FontWeight.Bold, fontSize = 18.sp)
         Text("Scan with Windows LANVault to pair instantly", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
         Spacer(modifier = Modifier.height(8.dp))

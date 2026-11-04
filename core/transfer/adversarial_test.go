@@ -3,12 +3,16 @@ package transfer
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/base64"
+	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"lanvault/core/identity"
+	"lanvault/core/pairing"
 	"lanvault/core/protocol"
 	"lanvault/core/store"
 )
@@ -254,4 +258,134 @@ func TestAdversarialSourceFileModifiedMidTransfer(t *testing.T) {
 		t.Fatal("expected StartSend to fail when source file is modified")
 	}
 	t.Logf("StartSend correctly failed on modified file: %v", err)
+}
+
+func TestAdversarialReceiverMismatchedFingerprint(t *testing.T) {
+	sourceDir := t.TempDir()
+	filePath := filepath.Join(sourceDir, "test.bin")
+	_ = os.WriteFile(filePath, []byte("adversarial payload"), 0644)
+
+	items, totalFiles, totalBytes, manifestHash, err := ScanSourceItems([]string{sourceDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	receiverID, _ := identity.GenerateNewIdentity()
+	senderID, _ := identity.GenerateNewIdentity()
+	attackerID, _ := identity.GenerateNewIdentity()
+	st, _ := store.OpenStore(":memory:")
+	defer st.Close()
+
+	destDir := t.TempDir()
+	addr, _, closeListener := startTestReceiver(t, receiverID, st, destDir, false)
+	defer closeListener()
+
+	// Sender pins attackerID's fingerprint instead of receiverID's fingerprint
+	_, err = StartSend(
+		addr, senderID, "PinSender", "pin-test-01", items, totalFiles, totalBytes,
+		manifestHash, 65536, nil, attackerID.Fingerprint,
+	)
+	if err == nil {
+		t.Fatal("expected StartSend to fail with fingerprint mismatch")
+	}
+	t.Logf("StartSend correctly rejected mismatched fingerprint: %v", err)
+}
+
+func TestAdversarialTransferDeclinedSentinel(t *testing.T) {
+	receiverID, _ := identity.GenerateNewIdentity()
+	senderID, _ := identity.GenerateNewIdentity()
+	st, _ := store.OpenStore(":memory:")
+	defer st.Close()
+
+	_ = st.SaveTrustedDevice(store.TrustedDevice{
+		Fingerprint: senderID.Fingerprint, DeviceID: senderID.DeviceID,
+		Name: "DeclinedSender", Platform: "windows",
+		PairedAt: time.Now().UnixMilli(), LastSeen: time.Now().UnixMilli(),
+	})
+
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", receiverID.ServerTLSConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	onDecision := func(offer protocol.OfferMessage, peerName, peerFP string) (bool, string) {
+		return false, ""
+	}
+
+	errChan := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			errChan <- err
+			return
+		}
+		defer conn.Close()
+		errChan <- HandleIncomingControl(conn, receiverID, st, onDecision, listener)
+	}()
+
+	sourceDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(sourceDir, "data.txt"), []byte("sample"), 0644)
+	items, totalFiles, totalBytes, manifestHash, _ := ScanSourceItems([]string{sourceDir})
+
+	// Sender tries to send, receiver declines in onDecision
+	_, _ = StartSend(
+		listener.Addr().String(), senderID, "DeclinedSender", "dec-test-01", items, totalFiles, totalBytes,
+		manifestHash, 65536, nil, receiverID.Fingerprint,
+	)
+
+	rxErr := <-errChan
+	if !errors.Is(rxErr, ErrTransferDeclined) {
+		t.Fatalf("expected ErrTransferDeclined, got: %v", rxErr)
+	}
+}
+
+func TestAdversarialPairingSuccessSentinel(t *testing.T) {
+	receiverID, _ := identity.GenerateNewIdentity()
+	senderID, _ := identity.GenerateNewIdentity()
+	st, _ := store.OpenStore(":memory:")
+	defer st.Close()
+
+	pm := pairing.NewManager()
+	tokenBytes, _ := pm.CreateNewToken()
+	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
+	SetPairingManager(pm)
+
+	destDir := t.TempDir()
+	addr, errChan, closeListener := startTestReceiver(t, receiverID, st, destDir, false)
+	defer closeListener()
+
+	rawConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rawConn.Close()
+
+	tlsConn := tls.Client(rawConn, senderID.ClientTLSConfigPinned(receiverID.Fingerprint))
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+
+	hello := protocol.HelloMessage{
+		Version:  protocol.Version{Major: protocol.ProtocolMajor, Minor: protocol.ProtocolMinor},
+		DeviceID: senderID.DeviceID,
+		Name:     "PairingSender",
+		Platform: "windows",
+		Role:     "control",
+	}
+	_ = protocol.WriteJSONFrame(tlsConn, protocol.FrameHello, hello)
+	_, _ = protocol.ReadFrame(tlsConn)
+
+	pairReq := protocol.PairRequestMessage{
+		Token:    token,
+		Name:     "PairingSender",
+		Platform: "windows",
+	}
+	_ = protocol.WriteJSONFrame(tlsConn, protocol.FramePairRequest, pairReq)
+	_, _ = protocol.ReadFrame(tlsConn)
+
+	rxErr := <-errChan
+	if !errors.Is(rxErr, ErrPairingSuccess) {
+		t.Fatalf("expected ErrPairingSuccess, got: %v", rxErr)
+	}
 }

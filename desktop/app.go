@@ -138,6 +138,7 @@ func (a *App) startup(ctx context.Context) {
 
 	// Start UDP discovery
 	a.broadcaster = discovery.NewBeaconBroadcaster(a.id.DeviceID, a.deviceName, "windows", protocol.DefaultPort)
+	a.broadcaster.SetVisibility(a.visibility)
 	a.broadcaster.Start()
 
 	bl, err := discovery.StartBeaconListener(a.tracker, protocol.BeaconPort, a.id.DeviceID)
@@ -194,7 +195,21 @@ func (a *App) acceptLoop() {
 			}
 
 			if err := transfer.HandleIncomingControl(c, a.id, a.st, onDecision, a.tcpListener); err != nil {
-				runtime.EventsEmit(a.ctx, "transfer:error", err.Error())
+				if errors.Is(err, transfer.ErrPairingSuccess) {
+					runtime.EventsEmit(a.ctx, "pairing:success", map[string]any{
+						"message": "Device paired successfully",
+					})
+				} else if errors.Is(err, transfer.ErrTransferDeclined) {
+					runtime.EventsEmit(a.ctx, "transfer:declined", map[string]any{
+						"message": "Transfer declined",
+					})
+				} else if errors.Is(err, transfer.ErrTransferCancelled) {
+					runtime.EventsEmit(a.ctx, "transfer:cancelled", map[string]any{
+						"message": "Transfer cancelled",
+					})
+				} else {
+					runtime.EventsEmit(a.ctx, "transfer:error", err.Error())
+				}
 			} else {
 				runtime.EventsEmit(a.ctx, "transfer:completed", "Transfer completed successfully")
 			}
@@ -233,14 +248,21 @@ func (a *App) UpdateSetting(key, val string) error {
 	}
 	if key == "general.device_name" || key == "device_name" {
 		a.deviceName = val
+		if a.broadcaster != nil {
+			a.broadcaster.SetName(val)
+		}
 		_ = a.st.SetSetting("general.device_name", val)
 		return a.st.SetSetting("device_name", val)
 	} else if key == "receive.save_location" || key == "save_directory" || key == "save_dir" {
 		a.saveDir = val
 		_ = a.st.SetSetting("receive.save_location", val)
 		return a.st.SetSetting("save_directory", val)
-	} else if key == "visibility" {
+	} else if key == "visibility" || key == "receiving.visibility" {
 		a.visibility = val
+		if a.broadcaster != nil {
+			a.broadcaster.SetVisibility(val)
+		}
+		_ = a.st.SetSetting("receiving.visibility", val)
 		return a.st.SetSetting("visibility", val)
 	}
 	return a.st.SetSetting(key, val)
@@ -317,10 +339,48 @@ func (a *App) ScanItems(paths []string) (*ScannedSelection, error) {
 	}, nil
 }
 
+// probePeerFingerprint connects via mutual TLS to inspect the receiver certificate.
+func (a *App) probePeerFingerprint(targetAddr string) (string, error) {
+	rawConn, err := net.DialTimeout("tcp", targetAddr, 5*time.Second)
+	if err != nil {
+		return "", fmt.Errorf("connect to %s: %w", targetAddr, err)
+	}
+	defer rawConn.Close()
+
+	tlsConn := tls.Client(rawConn, a.id.ClientTLSConfig())
+	_ = tlsConn.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := tlsConn.Handshake(); err != nil {
+		return "", fmt.Errorf("tls handshake with %s: %w", targetAddr, err)
+	}
+	certs := tlsConn.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		return "", errors.New("receiver presented no certificate")
+	}
+	return identity.FingerprintFromDER(certs[0].Raw), nil
+}
+
 // StartSend initiates file transfer to target. expectedPeerFP pins the TLS
-// certificate of the selected peer; an empty value is only valid for the
-// explicit manual-address path, and the receiver still enforces pairing.
+// certificate of the selected peer; an empty value is verified via TLS probe
+// against local trusted devices to prevent unverified manual-address sends.
 func (a *App) StartSend(targetAddr string, paths []string, expectedPeerFP string) error {
+	if expectedPeerFP == "" {
+		probedFP, err := a.probePeerFingerprint(targetAddr)
+		if err != nil {
+			return fmt.Errorf("failed to verify receiver identity: %w", err)
+		}
+		if a.st == nil {
+			return errors.New("cannot verify receiver trust: store is uninitialized")
+		}
+		if _, err := a.st.GetTrustedDevice(probedFP); err != nil {
+			return fmt.Errorf("receiver (%s) is not a paired or trusted device; pair devices first", identity.ShortFingerprintGrouped(probedFP))
+		}
+		expectedPeerFP = probedFP
+	} else if a.st != nil {
+		if _, err := a.st.GetTrustedDevice(expectedPeerFP); err != nil {
+			return fmt.Errorf("receiver (%s) is not a trusted device; pair devices first", identity.ShortFingerprintGrouped(expectedPeerFP))
+		}
+	}
+
 	items, totalFiles, totalBytes, manifestHash, err := transfer.ScanSourceItems(paths)
 	if err != nil {
 		return err

@@ -261,6 +261,7 @@ export const HomeTab: React.FC<HomeTabProps> = ({
               return (
                 <div
                   key={dev.device_id}
+                  data-device-id={dev.device_id}
                   style={{
                     backgroundColor: 'var(--bg-surface)',
                     border: '1px solid var(--border-subtle)',
@@ -273,6 +274,18 @@ export const HomeTab: React.FC<HomeTabProps> = ({
                   }}
                   onMouseEnter={(e) => (e.currentTarget.style.borderColor = 'var(--accent-default)')}
                   onMouseLeave={(e) => (e.currentTarget.style.borderColor = 'var(--border-subtle)')}
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    e.currentTarget.style.borderColor = 'var(--accent-default)';
+                  }}
+                  onDragLeave={(e) => {
+                    e.preventDefault();
+                    e.currentTarget.style.borderColor = 'var(--border-subtle)';
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    onSendToDevice(dev);
+                  }}
                 >
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>

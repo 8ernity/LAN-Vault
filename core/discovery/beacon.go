@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -125,22 +126,39 @@ func (t *Tracker) Subscribe(fn func([]DiscoveredPeer)) {
 
 // BeaconBroadcaster broadcasts UDP beacons every BEACON_INTERVAL_MS
 type BeaconBroadcaster struct {
-	deviceID string
-	name     string
-	platform string
-	port     int
-	stopChan chan struct{}
+	mu         sync.RWMutex
+	deviceID   string
+	name       string
+	platform   string
+	port       int
+	visibility string
+	stopChan   chan struct{}
 }
 
 // NewBeaconBroadcaster creates a broadcaster
 func NewBeaconBroadcaster(deviceID, name, platform string, port int) *BeaconBroadcaster {
 	return &BeaconBroadcaster{
-		deviceID: deviceID,
-		name:     name,
-		platform: platform,
-		port:     port,
-		stopChan: make(chan struct{}),
+		deviceID:   deviceID,
+		name:       name,
+		platform:   platform,
+		port:       port,
+		visibility: "everyone",
+		stopChan:   make(chan struct{}),
 	}
+}
+
+// SetVisibility updates the advertising visibility mode ("everyone", "contacts", "hidden")
+func (b *BeaconBroadcaster) SetVisibility(v string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.visibility = v
+}
+
+// SetName updates the advertised device name
+func (b *BeaconBroadcaster) SetName(name string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.name = name
 }
 
 // Start begins broadcasting on BEACON_PORT (47801) every BEACON_INTERVAL_MS (2000 ms)
@@ -169,11 +187,23 @@ func (b *BeaconBroadcaster) Stop() {
 }
 
 func (b *BeaconBroadcaster) broadcastOnce() {
+	b.mu.RLock()
+	vis := b.visibility
+	if strings.EqualFold(vis, "hidden") {
+		b.mu.RUnlock()
+		return
+	}
+	name := b.name
+	if strings.EqualFold(vis, "contacts") || strings.EqualFold(vis, "contacts_only") {
+		name = "LANVault Device"
+	}
+	b.mu.RUnlock()
+
 	payload := BeaconPayload{
 		V:        protocol.ProtocolMajor,
 		ID:       b.deviceID,
 		DeviceID: b.deviceID,
-		Name:     b.name,
+		Name:     name,
 		Plat:     b.platform,
 		Platform: b.platform,
 		Port:     b.port,

@@ -29,7 +29,7 @@ import {
   ScanItems,
   StartSend,
 } from '../wailsjs/go/main/App';
-import { EventsOn, EventsOff } from '../wailsjs/runtime/runtime';
+import { EventsOn, EventsOff, OnFileDrop, OnFileDropOff } from '../wailsjs/runtime/runtime';
 import { main, discovery, store, diag } from '../wailsjs/go/models';
 
 interface Toast {
@@ -46,6 +46,7 @@ function App() {
   const [recentTransfers, setRecentTransfers] = useState<store.TransferRecord[]>([]);
   const [selectedDevice, setSelectedDevice] = useState<discovery.DiscoveredPeer | null>(null);
   const [pairingQR, setPairingQR] = useState<string>('');
+  const [droppedPaths, setDroppedPaths] = useState<string[]>([]);
 
   const [activeProgress, setActiveProgress] = useState<{
     bytesAcked: number;
@@ -176,6 +177,28 @@ function App() {
     };
   }, [loadRecentTransfers, loadTrustedDevices]);
 
+  // Handle native file drop events via Wails runtime
+  useEffect(() => {
+    OnFileDrop((x: number, y: number, paths: string[]) => {
+      if (!paths || paths.length === 0) return;
+      const el = document.elementFromPoint(x, y);
+      const deviceCard = el?.closest('[data-device-id]');
+      if (deviceCard) {
+        const devId = deviceCard.getAttribute('data-device-id');
+        const targetDev = nearbyDevices.find((d) => d.device_id === devId);
+        if (targetDev) {
+          setSelectedDevice(targetDev);
+        }
+      }
+      setDroppedPaths(paths);
+      setActiveTab('send');
+    }, false);
+
+    return () => {
+      OnFileDropOff();
+    };
+  }, [nearbyDevices]);
+
   // Actions
   const handleToggleTheme = () => {
     setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'));
@@ -198,10 +221,22 @@ function App() {
   };
 
   const handlePickFilesForSend = async () => {
+    try {
+      const files = await PickFiles();
+      if (files && files.length > 0) {
+        setDroppedPaths(files);
+      }
+    } catch (_) {}
     setActiveTab('send');
   };
 
   const handlePickFolderForSend = async () => {
+    try {
+      const folder = await PickFolder();
+      if (folder) {
+        setDroppedPaths([folder]);
+      }
+    } catch (_) {}
     setActiveTab('send');
   };
 
@@ -360,6 +395,8 @@ function App() {
               nearbyDevices={nearbyDevices}
               selectedDevice={selectedDevice}
               trustedDevices={trustedDevices}
+              initialPaths={droppedPaths}
+              onClearInitialPaths={() => setDroppedPaths([])}
               onSelectDevice={setSelectedDevice}
               onPickFiles={PickFiles}
               onPickFolder={PickFolder}

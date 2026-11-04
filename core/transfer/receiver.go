@@ -36,6 +36,13 @@ var (
 
 	errNeedRetry = errors.New("chunk must be re-requested before finalization")
 	errNotFinal  = errors.New("file is not fully received")
+
+	// ErrPairingSuccess indicates that an incoming control connection was a successful pairing handshake.
+	ErrPairingSuccess = errors.New("pairing successful")
+	// ErrTransferDeclined indicates that an incoming offer was declined by the user or timed out.
+	ErrTransferDeclined = errors.New("transfer declined by user")
+	// ErrTransferCancelled indicates that a transfer was cancelled by the peer or user.
+	ErrTransferCancelled = errors.New("transfer cancelled")
 )
 
 // SetPairingManager configures the active pairing manager for handling PAIR_REQUEST frames
@@ -270,7 +277,10 @@ func HandleIncomingControl(
 
 	switch frame.Type {
 	case protocol.FramePairRequest:
-		return handlePairRequest(tlsConn, frame.Payload, hello, helloOk, peerFP, st, paired)
+		if err := handlePairRequest(tlsConn, frame.Payload, hello, helloOk, peerFP, st, paired); err != nil {
+			return err
+		}
+		return ErrPairingSuccess
 	case protocol.FrameOffer:
 		// handled below
 	default:
@@ -378,7 +388,7 @@ func HandleIncomingControl(
 		accept, dir := onDecision(*offer, hello.Name, peerFP)
 		if !accept {
 			writeReject(tlsConn, offer.TransferID, protocol.ErrCodeRejected, "Declined by user")
-			return nil
+			return ErrTransferDeclined
 		}
 		targetDir = dir
 	}
@@ -1087,7 +1097,13 @@ func (s *ReceiverSession) controlLoop() error {
 		f, err := protocol.ReadFrame(s.controlConn)
 		if err != nil {
 			if s.isTerminal() {
-				return nil
+				if s.cancelled {
+					return ErrTransferCancelled
+				}
+				if s.doneOk != nil {
+					return nil
+				}
+				return errors.New("transfer ended without verified completion")
 			}
 			s.noteError(err.Error())
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
@@ -1110,7 +1126,7 @@ func (s *ReceiverSession) controlLoop() error {
 			}
 		case protocol.FrameCancel:
 			s.cancel()
-			return nil
+			return ErrTransferCancelled
 		case protocol.FramePause:
 			// Bitmaps are persisted after every chunk, so pausing requires no
 			// additional state write. Keep the session open.

@@ -31,6 +31,9 @@ func main() {
 			WindowIsTranslucent:  false,
 			BackdropType:         windows.Mica,
 		},
+		DragAndDrop: &options.DragAndDrop{
+			EnableFileDrop: true,
+		},
 		Bind: []interface{}{
 			app,
 		},

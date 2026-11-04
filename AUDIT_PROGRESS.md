@@ -164,9 +164,14 @@
 | **F09** | High | Android CI | Machine-specific `org.gradle.java.home` in `gradle.properties` | **RESOLVED** | Removed hardcoded Windows path so Gradle utilizes CI/system JDK |
 | **F10** | Critical | Android Filesystem | Unsafe path sanitization prone to traversal and collisions (P0-01) | **RESOLVED** | Implemented `PathPlanner.kt` and `PathPlannerTest.kt` with canonical containment, segment validation, reserved names, and atomic `commitNoReplace` |
 | **F11** | High | Desktop UI | TypeScript build failure on `selectedDevice.fingerprint` (P2-02) | **RESOLVED** | Added `store` import to `SendTab.tsx` and resolved peer fingerprint lookup against `trustedDevices` by `device_id` |
-| **F12** | High | Cross-Platform Testing | Missing adversarial test coverage for early DONE, unauthorized DATA streams, and modified source files | **RESOLVED** | Created `core/transfer/adversarial_test.go` and verified all three test cases pass |
+| **F12** | High | Cross-Platform Testing | Missing adversarial test coverage for early DONE, unauthorized DATA streams, and modified source files | **RESOLVED** | Created `core/transfer/adversarial_test.go` and verified all test cases pass |
 | **F13** | High | Android Transfer | Flow control & retransmission bounds on `CHUNK_NEED` (P1-01, P1-02) | **RESOLVED** | Bound in-flight chunk window, bounded retransmit retries up to 512, and verified chunk hash prior verification |
 | **F14** | High | CI Toolchain | GitHub Actions Java 17 vs Java 21 bytecode mismatch (P2-01) | **RESOLVED** | Configured `setup-java` with `java-version: '21'` and `distribution: 'temurin'` in `.github/workflows/ci.yml` |
+| **F15** | Critical | Identity & Pairing | Receiver identity verification missing on manual address connections (P0-04) | **RESOLVED** | Implemented TLS fingerprint probe `probePeerFingerprint` and store trust verification in `desktop/app.go` and `TransferEngine.kt`; added `TestAdversarialReceiverMismatchedFingerprint` |
+| **F16** | High | Transfer Events | False `transfer:completed` events emitted on pairing, declines, and cancels (P1) | **RESOLVED** | Added `ErrPairingSuccess`, `ErrTransferDeclined`, `ErrTransferCancelled` sentinels in `receiver.go`; updated `desktop/app.go` to emit distinct events |
+| **F17** | Medium | Discovery & Privacy | Device visibility settings not reflected on UDP beacon broadcaster (P1) | **RESOLVED** | Added `SetVisibility` and `SetName` to `beacon.go`; suppresses broadcasts when hidden; advertises generic name when contacts only |
+| **F18** | Medium | Android Pairing UI | QR pairing token expiration synchronization (P1) | **RESOLVED** | Added 120s countdown ticker, auto-refresh on expiration, and manual refresh button in `MainScreen.kt` |
+| **F19** | Medium | Desktop UI & UX | Native drag-and-drop to recipient cards and send dropzones (P1) | **RESOLVED** | Configured Wails `options.DragAndDrop{ EnableFileDrop: true }` in `main.go`; wired `OnFileDrop` targeting device cards in `App.tsx` and `SendTab.tsx` |
 
 ---
 
@@ -237,12 +242,18 @@ ok      lanvault/core/protocol    3.004s
 === RUN   TestStoreOperations
 --- PASS: TestStoreOperations (0.06s)
 ok      lanvault/core/store       2.500s
+=== RUN   TestAdversarialReceiverMismatchedFingerprint
+--- PASS: TestAdversarialReceiverMismatchedFingerprint (0.05s)
 === RUN   TestAdversarialEarlyDoneRejected
 --- PASS: TestAdversarialEarlyDoneRejected (0.04s)
 === RUN   TestAdversarialUnauthorizedDataStream
 --- PASS: TestAdversarialUnauthorizedDataStream (0.18s)
 === RUN   TestAdversarialSourceFileModifiedMidTransfer
 --- PASS: TestAdversarialSourceFileModifiedMidTransfer (0.29s)
+=== RUN   TestAdversarialTransferDeclinedSentinel
+--- PASS: TestAdversarialTransferDeclinedSentinel (0.05s)
+=== RUN   TestAdversarialPairingSuccessSentinel
+--- PASS: TestAdversarialPairingSuccessSentinel (0.05s)
 === RUN   TestResumeAfterInterruption
 --- PASS: TestResumeAfterInterruption (1.18s)
 === RUN   TestUnpairedSenderRejectedByDefault
@@ -280,25 +291,34 @@ computing gzip size...
 desktop/frontend/dist/index.html                   0.38 kB │ gzip:  0.26 kB
 desktop/frontend/dist/assets/index-Bu1WOscX.css    2.09 kB │ gzip:  0.98 kB
 desktop/frontend/dist/assets/index-BHCn48im.js   320.72 kB │ gzip: 94.73 kB
-✓ built in 31.62s
+✓ built in 2m 15s
 ```
 
-### Android Gradle Unit Tests (`gradlew.bat testDebugUnitTest --rerun-tasks`)
+### Android Gradle Unit Tests (`gradlew.bat testDebugUnitTest`)
 ```text
 > Task :app:compileDebugKotlin
 > Task :app:compileDebugUnitTestKotlin
 > Task :app:testDebugUnitTest
 
-BUILD SUCCESSFUL in 2m 34s
-24 actionable tasks: 24 executed
+BUILD SUCCESSFUL in 10m 11s
+24 actionable tasks: 5 executed, 19 up-to-date
+Test Suites:
+- BitmapTest: 2 tests, 0 failures, 0 errors
+- PathPlannerTest: 6 tests, 0 failures, 0 errors
+- MainScreenViewModelTest: 2 tests, 0 failures, 0 errors
+Total: 10 tests, 0 failures, 0 errors, 100% PASS
 ```
 
 ### Android Debug APK Assembly (`gradlew.bat assembleDebug`)
 ```text
+> Task :app:dexBuilderDebug
+> Task :app:mergeProjectDexDebug
+> Task :app:packageDebug
 > Task :app:assembleDebug
 
-BUILD SUCCESSFUL in 7m 23s
-36 actionable tasks: 5 executed, 31 up-to-date
+BUILD SUCCESSFUL in 11m 57s
+36 actionable tasks: 4 executed, 32 up-to-date
+Output: android/app/build/outputs/apk/debug/app-debug.apk (68.5 MB)
 ```
 
 ---

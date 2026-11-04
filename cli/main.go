@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -122,7 +123,15 @@ func main() {
 			go func(c net.Conn) {
 				defer c.Close()
 				if err := transfer.HandleIncomingControl(c, id, st, onDecision, listener); err != nil {
-					fmt.Printf("Transfer error: %v\n", err)
+					if errors.Is(err, transfer.ErrPairingSuccess) {
+						fmt.Println("\n[SUCCESS] Device paired successfully!")
+					} else if errors.Is(err, transfer.ErrTransferDeclined) {
+						fmt.Println("\n[INFO] Transfer declined.")
+					} else if errors.Is(err, transfer.ErrTransferCancelled) {
+						fmt.Println("\n[INFO] Transfer cancelled.")
+					} else {
+						fmt.Printf("Transfer error: %v\n", err)
+					}
 				} else {
 					fmt.Println("\n[SUCCESS] Transfer completed successfully!")
 				}

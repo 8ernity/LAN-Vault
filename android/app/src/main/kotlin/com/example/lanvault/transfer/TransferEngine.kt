@@ -1100,6 +1100,28 @@ class TransferEngine(
             }
             val isResume = sameBinding
 
+            if (!isResume) {
+                val acceptCompletable = CompletableDeferred<Boolean>()
+                val callback = onIncomingOffer
+                if (callback == null) {
+                    acceptCompletable.complete(false)
+                } else {
+                    callback.invoke(transferId, peerName, peerFp, fileCount, totalBytes) { accepted ->
+                        acceptCompletable.complete(accepted)
+                    }
+                }
+                val accepted = withTimeoutOrNull(Protocol.OFFER_RESPONSE_TIMEOUT_S * 1000L) { acceptCompletable.await() } ?: false
+                if (!accepted) {
+                    Framing.writeJSONFrame(output, Protocol.FRAME_REJECT, JSONObject().apply {
+                        put("transfer_id", transferId)
+                        put("code", Protocol.ERR_REJECTED)
+                        put("message", "Declined by user")
+                    }.toString())
+                    socket.close()
+                    return@withContext
+                }
+            }
+
             var destinationMode = DestinationMode.FILE
             var fileRoot: File? = null
             var safRoot: DocumentFile? = null
@@ -1127,27 +1149,6 @@ class TransferEngine(
             }
 
             if (safRoot == null && fileRoot == null) {
-                if (!isResume) {
-                    val acceptCompletable = CompletableDeferred<Boolean>()
-                    val callback = onIncomingOffer
-                    if (callback == null) {
-                        acceptCompletable.complete(false)
-                    } else {
-                        callback.invoke(transferId, peerName, peerFp, fileCount, totalBytes) { accepted ->
-                            acceptCompletable.complete(accepted)
-                        }
-                    }
-                    val accepted = withTimeoutOrNull(Protocol.OFFER_RESPONSE_TIMEOUT_S * 1000L) { acceptCompletable.await() } ?: false
-                    if (!accepted) {
-                        Framing.writeJSONFrame(output, Protocol.FRAME_REJECT, JSONObject().apply {
-                            put("transfer_id", transferId)
-                            put("code", Protocol.ERR_REJECTED)
-                            put("message", "Declined by user")
-                        }.toString())
-                        socket.close()
-                        return@withContext
-                    }
-                }
                 var saveDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "LANVault")
                 if (!saveDir.exists() && !saveDir.mkdirs()) {
                     saveDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: File(context.filesDir, "LANVault")
@@ -1498,8 +1499,14 @@ class TransferEngine(
         val peerCert = certs.firstOrNull() as? java.security.cert.X509Certificate
             ?: throw IOException("No peer certificate provided by receiver")
         val actualPeerFp = IdentityManager.computeFingerprint(peerCert)
-        if (!peerFingerprint.isNullOrBlank() && !peerFingerprint.equals(actualPeerFp, ignoreCase = true)) {
-            throw IOException("Peer fingerprint mismatch: expected $peerFingerprint, got $actualPeerFp")
+        if (!peerFingerprint.isNullOrBlank()) {
+            if (!peerFingerprint.equals(actualPeerFp, ignoreCase = true)) {
+                throw IOException("Peer fingerprint mismatch: expected $peerFingerprint, got $actualPeerFp")
+            }
+        } else {
+            if (!db.isTrusted(actualPeerFp)) {
+                throw IOException("Receiver ($actualPeerFp) is not a paired or trusted device. Pair devices first.")
+            }
         }
 
         val resumable = db.findResumableSend(manifestHash, actualPeerFp)

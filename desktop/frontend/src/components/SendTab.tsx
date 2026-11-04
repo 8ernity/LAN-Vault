@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   UploadCloud, 
   FolderPlus, 
@@ -21,6 +21,8 @@ interface SendTabProps {
   onPickFolder: () => Promise<string>;
   onScanItems: (paths: string[]) => Promise<main.ScannedSelection>;
   onStartTransfer: (targetAddr: string, paths: string[], peerFingerprint: string) => Promise<void>;
+  initialPaths?: string[];
+  onClearInitialPaths?: () => void;
 }
 
 export const SendTab: React.FC<SendTabProps> = ({
@@ -32,12 +34,43 @@ export const SendTab: React.FC<SendTabProps> = ({
   onPickFolder,
   onScanItems,
   onStartTransfer,
+  initialPaths,
+  onClearInitialPaths,
 }) => {
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const [scanResult, setScanResult] = useState<main.ScannedSelection | null>(null);
   const [manualAddr, setManualAddr] = useState<string>('');
   const [showManual, setShowManual] = useState<boolean>(false);
   const [isSending, setIsSending] = useState<boolean>(false);
+  const [isDragOver, setIsDragOver] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (initialPaths && initialPaths.length > 0) {
+      const merged = Array.from(new Set([...selectedPaths, ...initialPaths]));
+      setSelectedPaths(merged);
+      onScanItems(merged)
+        .then(setScanResult)
+        .catch(console.error);
+      onClearInitialPaths?.();
+    }
+  }, [initialPaths]);
+
+  const handleDropzoneDrop = async (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setIsDragOver(false);
+    const files = Array.from(e.dataTransfer.files);
+    const paths = files.map((f: any) => f.path || f.name).filter(Boolean);
+    if (paths.length > 0) {
+      const merged = Array.from(new Set([...selectedPaths, ...paths]));
+      setSelectedPaths(merged);
+      try {
+        const scanned = await onScanItems(merged);
+        setScanResult(scanned);
+      } catch (err) {
+        console.error('Scan dropped items failed:', err);
+      }
+    }
+  };
 
   const handleAddFiles = async () => {
     try {
@@ -139,17 +172,33 @@ export const SendTab: React.FC<SendTabProps> = ({
         </div>
 
         {/* Dropzone & Buttons */}
-        <div style={{
-          border: '2px dashed var(--border-subtle)',
-          borderRadius: 'var(--radius-control)',
-          padding: '28px',
-          textAlign: 'center',
-          backgroundColor: 'var(--bg-base)',
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          gap: '12px'
-        }}>
+        <div
+          onDragOver={(e) => {
+            e.preventDefault();
+            setIsDragOver(true);
+          }}
+          onDragEnter={(e) => {
+            e.preventDefault();
+            setIsDragOver(true);
+          }}
+          onDragLeave={(e) => {
+            e.preventDefault();
+            setIsDragOver(false);
+          }}
+          onDrop={handleDropzoneDrop}
+          style={{
+            border: isDragOver ? '2px dashed var(--accent-default)' : '2px dashed var(--border-subtle)',
+            borderRadius: 'var(--radius-control)',
+            padding: '28px',
+            textAlign: 'center',
+            backgroundColor: isDragOver ? 'rgba(79, 134, 247, 0.08)' : 'var(--bg-base)',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            gap: '12px',
+            transition: 'border-color 0.15s ease, background-color 0.15s ease'
+          }}
+        >
           <UploadCloud size={32} color="var(--accent-default)" />
           <div>
             <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-primary)' }}>
